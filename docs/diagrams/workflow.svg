@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="680" viewBox="0 0 1200 680" role="img" aria-labelledby="title description">
+<title id="title">From a local idea to a protected chat URL</title>
+<desc id="description">Start on your machine. Deploy only when the app is ready.</desc>
+<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M1,1 L9,5 L1,9" fill="none" stroke="#183153" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect width="1200" height="680" fill="#fff"/>
+<text font-family="Arial, Helvetica, sans-serif" font-size="32" fill="#183153" text-anchor="start"><tspan x="50" y="62">From a local idea to a protected chat URL</tspan></text>
+<text font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#183153" text-anchor="start"><tspan x="50" y="103">Start on your machine. Deploy only when the app is ready.</tspan></text>
+<text font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#183153" text-anchor="start"><tspan x="50" y="146">ON YOUR MACHINE</tspan></text>
+<rect x="50" y="170" width="300" height="150" rx="12" fill="#e7f5ff" stroke="#183153" stroke-width="2"/>
+<text font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#183153" text-anchor="middle"><tspan x="200" y="227.5">1. Create</tspan><tspan x="200" y="252.5">init</tspan><tspan x="200" y="277.5">No keys or cloud needed</tspan></text>
+<rect x="450" y="170" width="300" height="150" rx="12" fill="#e7f5ff" stroke="#183153" stroke-width="2"/>
+<text font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#183153" text-anchor="middle"><tspan x="600" y="227.5">2. Customize</tspan><tspan x="600" y="252.5">agent.ts + tools.ts + public/</tspan><tspan x="600" y="277.5">You or your coding assistant</tspan></text>
+<rect x="850" y="170" width="300" height="150" rx="12" fill="#e7f5ff" stroke="#183153" stroke-width="2"/>
+<text font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#183153" text-anchor="middle"><tspan x="1000" y="227.5">3. Try locally</tspan><tspan x="1000" y="252.5">dev -&gt; browser login</tspan><tspan x="1000" y="277.5">Password + OpenAI key</tspan></text>
+<path d="M 362 245 L 438 245" fill="none" stroke="#183153" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M 762 245 L 838 245" fill="none" stroke="#183153" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#183153" text-anchor="start"><tspan x="50" y="363">Local sessions use memory, not Redis. Real chat calls may incur model charges.</tspan></text>
+<text font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#183153" text-anchor="start"><tspan x="50" y="436">WHEN READY TO DEPLOY</tspan></text>
+<rect x="50" y="460" width="300" height="150" rx="12" fill="#fff9db" stroke="#183153" stroke-width="2"/>
+<text font-family="Arial, Helvetica, sans-serif" font-size="19" fill="#183153" text-anchor="middle"><tspan x="200" y="518.375">4. Preview deployment</tspan><tspan x="200" y="542.125">deploy --dry-run</tspan><tspan x="200" y="565.875">Local validation; no cloud calls</tspan></text>
+<rect x="450" y="460" width="300" height="150" rx="12" fill="#ebfbee" stroke="#183153" stroke-width="2"/>
+<text font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#183153" text-anchor="middle"><tspan x="600" y="517.5">5. Deploy with permission</tspan><tspan x="600" y="542.5">Railway or Cloud Run</tspan><tspan x="600" y="567.5">Your account + TLS Redis</tspan></text>
+<rect x="850" y="460" width="300" height="150" rx="12" fill="#ebfbee" stroke="#183153" stroke-width="2"/>
+<text font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#183153" text-anchor="middle"><tspan x="1000" y="519.25">6. Use and inspect</tspan><tspan x="1000" y="541.75">Chat URL / check / dashboard</tspan><tspan x="1000" y="564.25">Health checks do not call models</tspan></text>
+<path d="M 362 535 L 438 535" fill="none" stroke="#183153" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M 762 535 L 838 535" fill="none" stroke="#183153" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#183153" text-anchor="start"><tspan x="50" y="652">No GitHub required. Your coding assistant edits the app; it is not the deployed chat agent.</tspan></text>
+</svg>

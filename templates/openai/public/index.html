@@ -1,0 +1,7 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chat agent</title><link rel="stylesheet" href="/style.css"><script type="module" src="/app.js"></script></head>
+<body><main><h1>Chat agent</h1><p id="status" role="status"></p>
+<form id="login"><label>Password <input id="password" type="password" maxlength="256" required autocomplete="current-password"></label><button>Log in</button></form>
+<section id="chat" hidden><div id="messages" aria-live="polite"></div><form id="send"><label>Message <textarea id="prompt" maxlength="4000" required></textarea></label><button id="submit">Send</button><button type="button" id="stop">Stop</button></form><button id="logout">Log out</button></section>
+<p>History stays in this page only. Model usage may incur charges.</p></main></body></html>

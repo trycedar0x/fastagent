@@ -1,0 +1,34 @@
+# Allow only known non-secret build inputs; add deliberate paths for custom assets.
+**
+!package.json
+!package-lock.json
+!tsconfig.json
+!fastagent.yaml
+!src/
+!src/**
+!public/
+!public/**
+# Defense in depth for nested credentials, including inside allowed source folders.
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+*.pem
+**/*.pem
+*.key
+**/*.key
+credentials*.json
+**/credentials*.json
+**/.npmrc
+**/.netrc
+**/.git
+**/.git/**
+**/.config
+**/.config/**
+**/.aws
+**/.aws/**
+**/.ssh
+**/.ssh/**
+**/.fastagent
+**/.fastagent/**

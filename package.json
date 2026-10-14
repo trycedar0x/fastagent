@@ -1,0 +1,48 @@
+{
+  "name": "@0xtryeva/fastagent",
+  "version": "0.1.0",
+  "description": "Create, deploy, and monitor protected chat agents on Railway and Cloud Run",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/trycedar0x/fastagent.git"
+  },
+  "homepage": "https://github.com/trycedar0x/fastagent#readme",
+  "bugs": {
+    "url": "https://github.com/trycedar0x/fastagent/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "bin": {
+    "fastagent": "dist/cli.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "dist",
+    "templates",
+    ".agents",
+    "docs",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc && node scripts/make-executable.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "test:redis": "node scripts/test-redis.mjs",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "yaml": "^2.8.1",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "openai": "^6.49.0",
+    "redis": "^6.3.0",
+    "typescript": "^5.9.2"
+  }
+}

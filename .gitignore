@@ -1,0 +1,13 @@
+node_modules/
+dist/
+coverage/
+*.tgz
+.env
+.env.*
+!.env.example
+.npmrc
+*.pem
+*.key
+credentials*.json
+.DS_Store
+.fastagent/
