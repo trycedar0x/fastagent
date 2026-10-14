@@ -10,23 +10,52 @@ Fastagent provides the project template, chat UI, deployment commands, and a sma
 
 [Edit this diagram in Excalidraw](docs/diagrams/workflow.excalidraw) · [How to edit the diagrams](docs/diagrams/README.md)
 
+## Build with your coding agent
+
+Paste this into Claude Code, Codex, or another coding agent. Replace the bracketed description with your idea:
+
+```text
+Help me build a chat agent using Fastagent.
+
+Agent idea: [Describe who it helps, what it should do, and any APIs it needs.]
+
+Install the CLI with npm install -g @0xtryeva/fastagent (Node.js 22+).
+Source: https://github.com/trycedar0x/fastagent.
+Create the app in a new directory; never overwrite existing files.
+
+Read AGENTS.md, docs/user-guide.md, and .agents/skills/fastagent/SKILL.md
+in the installed package at the npm root -g path under @0xtryeva/fastagent.
+Ask me about any missing requirements, then create a separate app with
+Fastagent's OpenAI template. Read the app instructions and the
+fastagent-app skill before editing its prompt, tools, or UI.
+
+Help me configure my API key locally and run the interactive password
+helper. Never ask me to paste secrets into chat, print them, or commit them.
+Keep password protection enabled and do not add shell-execution tools.
+Build and run the app locally so I can try it. Ask before making paid
+model calls yourself.
+
+Once the local app works, ask whether I want Railway or Cloud Run deployment.
+Explain the account, billing, authentication, and TLS Redis requirements.
+Start with deploy --dry-run. Wait for my explicit approval before real
+deployment, interactive cloud login, or deleting resources. Report what
+was actually verified; a dry run or health check does not prove chat works.
+```
+
 ## Start here
 
 You need Node.js 22+ and npm.
 
-The npm package name is `@0xtryeva/fastagent`, but this project has not been published to npm yet. Use the source checkout below; the unscoped `fastagent` npm package is an unrelated project.
+Install `@0xtryeva/fastagent`, not the unscoped `fastagent` package (an unrelated project).
 
-Run these commands in the Fastagent repository:
+Install the CLI and create an app:
 
 ```sh
-git clone https://github.com/trycedar0x/fastagent.git
-cd fastagent
-npm ci
-npm run build
-node dist/cli.js init ./my-agent --framework openai
+npm install -g @0xtryeva/fastagent
+fastagent init ./my-agent --framework openai
 ```
 
-This creates a separate app in `my-agent/`. Building Fastagent does **not** install a global `fastagent` command.
+This creates a new app in `my-agent/`; existing directories are never overwritten.
 
 In the generated app:
 
@@ -38,14 +67,27 @@ npm run hash-password
 
 The password helper asks for a password and writes its hash to ignored `.env.auth`. It does not print or save the password.
 
-Create an ignored `.env` file with your `OPENAI_API_KEY`. Then return to the Fastagent repository:
+Create an ignored `.env` file with your `OPENAI_API_KEY`. Then run from the app directory:
 
 ```sh
-cd ..
-node dist/cli.js dev ./my-agent
+fastagent dev
 ```
 
 Open the local URL printed by the server and log in. Real chats use your API key and may cost money. Local development does not need Redis or a cloud account; do not expose its HTTP port to the internet.
+
+## Build from source instead
+
+In a new checkout:
+
+```sh
+git clone https://github.com/trycedar0x/fastagent.git
+cd fastagent
+npm ci
+npm run build
+node dist/cli.js --help
+```
+
+This does not install a global command. Use the absolute path to `dist/cli.js` from an app directory, or follow the [source-based user guide](docs/user-guide.md).
 
 ## Deploy
 
@@ -61,7 +103,7 @@ Redis is only required in production. Local `dev` uses memory. You provide your 
 
 Add `REDIS_URL` to the app's ignored `.env`. Keep the password hash in `.env.auth`; do not copy it into `.env` or a command argument.
 
-Deployment commands run **inside the app directory**. Use the absolute path to Fastagent's `dist/cli.js` unless you already have `fastagent` on your PATH.
+Deployment commands run **inside the app directory**. Use `fastagent` if installed from npm, or the absolute path to the built `dist/cli.js` when using a source checkout.
 
 Start with `deploy --dry-run`. It checks local inputs without contacting the cloud. Removing `--dry-run` can create billable resources.
 
@@ -80,7 +122,7 @@ See the [user guide](docs/user-guide.md) for complete Railway and Cloud Run comm
 | `dashboard` | View locally recorded deployments in a terminal |
 | `destroy` | Delete verified app-owned resources, with `--yes` |
 
-Run `node dist/cli.js --help` for exact arguments. Most commands support `--json`. `dev`, interactive login, and the interactive dashboard do not; `dashboard --json` returns an offline snapshot.
+Run `fastagent --help` for exact arguments. Most commands support `--json`. `dev`, interactive login, and the interactive dashboard do not; `dashboard --json` returns an offline snapshot.
 
 ## Current limits
 
@@ -91,7 +133,7 @@ Run `node dist/cli.js --help` for exact arguments. Most commands support `--json
 - Cloud Run logs show metadata, not application message bodies.
 - Deleting an app may leave shared resources and costs behind.
 
-Local tests and mocked cloud tests pass. **Live cloud deployment, real Redis/Lua, Docker, browser login, fresh registry installation, and Windows behavior have not all been verified.** Mock tests are not proof of a successful cloud deployment.
+Local tests and mocked cloud tests pass. A fresh npm installation has been checked, including creating an app with the installed CLI. **Live cloud deployment, real Redis/Lua, Docker, browser login, and Windows behavior still need verification.** Mock tests are not proof of a successful cloud deployment.
 
 ## For coding assistants
 

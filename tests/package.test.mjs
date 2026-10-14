@@ -14,7 +14,7 @@ test('package: executable and all template assets survive npm packing', () => {
   const [packed] = JSON.parse(result.stdout);
   assert.equal(packed.name, '@0xtryeva/fastagent');
   const paths = packed.files.map((file) => file.path);
-  for (const path of ['dist/cli.js', 'package.json', 'LICENSE', 'docs/diagrams/workflow.svg',
+  for (const path of ['dist/cli.js', 'package.json', 'LICENSE', 'AGENTS.md', 'docs/diagrams/workflow.svg',
     'templates/openai/.dockerignore',
     'templates/openai/.env.example', 'templates/openai/gitignore.template',
     'templates/openai/AGENTS.md', 'templates/openai/README.md',
