@@ -1,6 +1,6 @@
 # User guide
 
-This guide takes you from a local project to a chat URL. The app uses the official OpenAI SDK and runs in your own cloud account.
+This guide takes you from a local project to a headless chat API. The app uses the official OpenAI SDK for OpenRouter or direct OpenAI and runs in your own cloud account.
 
 Fastagent creates the starting code. You or your coding assistant write the prompt and tools. The CLI does not use a model to generate your business logic.
 
@@ -38,13 +38,15 @@ The app includes:
 
 - `src/agent.ts`: prompt and OpenAI model adapter.
 - `src/tools.ts`: predefined tools; the example converts temperatures.
-- Server, authentication, session storage, and browser UI.
+- `src/server.ts`: headless HTTP server, bearer auth, streaming chat, and conversation history.
 - `fastagent.yaml`, package files, and a Dockerfile.
 - README, contributor instructions, and ignored local secret files.
 
+There is no browser UI. A newly generated app uses token access and does not serve `/api/login` or any browser password page.
+
 Edit the app yourself or ask Claude Code or Codex:
 
-> Make this a weather assistant using my weather API. Keep authentication, health checks, and deployment working.
+> Make this a weather assistant using my weather API. Keep bearer auth, health checks, and deployment working.
 
 Your coding assistant operates the local CLI. It is not the agent running in the deployed app.
 
@@ -55,12 +57,19 @@ In the generated app directory:
 ```sh
 cd my-agent
 npm install
-npm run hash-password
 ```
 
-Enter a password in the terminal. The helper hides the input and writes only its salted hash to `.env.auth`. It refuses to overwrite an existing file.
+Create an ignored `.env.auth` containing a random bearer token, and an ignored `.env` containing the model key selected by `fastagent.yaml`:
 
-Create an ignored `.env` containing your `OPENAI_API_KEY`. Do not commit, paste into logs, or pass the key as a command argument.
+```sh
+# .env.auth
+FASTAGENT_API_TOKEN=<at least 32 random bytes, base64url>
+
+# .env
+OPENROUTER_API_KEY=<your OpenRouter key>
+```
+
+The default model is `openrouter/deepseek/deepseek-v4.1-flash`, which uses `OPENROUTER_API_KEY`. An `openai/<model>` reference uses `OPENAI_API_KEY` instead. Do not set both. Keep every secret file ignored; do not commit, paste into logs, or pass keys as command arguments.
 
 Back in the Fastagent repository:
 
@@ -68,15 +77,33 @@ Back in the Fastagent repository:
 node dist/cli.js dev ./my-agent
 ```
 
-Open the URL printed by the server and log in. Stop with Ctrl-C.
+`dev` builds the app and starts the headless server on explicit localhost HTTP. Stop with Ctrl-C.
 
-- Local development uses memory sessions; Redis is not required.
-- Real chats can incur OpenAI charges.
+- Local development uses memory history; Redis is not required.
+- Real chats can incur model charges.
 - There is no hot reload. Restart after changes.
 - `--install` explicitly allows the CLI to install app dependencies.
 - Local HTTP binds to IPv4 loopback. Do not expose or tunnel it.
 
-## 4. Prepare for deployment
+Send a message with the headless client. The token is read only from the explicit `--env-file`, never from an argument or the inherited shell:
+
+```sh
+node dist/cli.js chat --url http://127.0.0.1:3000 --env-file ./my-agent/.env.auth --message "Hello"
+```
+
+`chat` accepts `--message` or reads stdin, supports `--conversation <id>` to resume a server-assigned conversation, and `--json` for one machine-readable result. The URL must be HTTPS or explicit localhost HTTP. The client refuses credential-bearing redirects so the token is not sent to another origin. It bounds response size and total time.
+
+## 4. Choose a model
+
+`fastagent models` reads the public OpenRouter catalog. It needs no key and makes no generation call, so it never incurs model charges:
+
+```sh
+node dist/cli.js models --search deepseek --limit 10 --json
+```
+
+Output includes an estimate in USD per million tokens, a fetch timestamp, a source URL, and tool support. Unknown prices stay `null` (unknown) rather than a fabricated number. Documented tilde-prefixed vendor aliases such as `~deepseek/deepseek-flash-latest` are accepted. The owner selects the model in `fastagent.yaml`; visitors cannot choose a model.
+
+## 5. Prepare for deployment
 
 You need your own cloud account, billing, provider CLI, and a TLS Redis service. Fastagent does not create Redis, enable billing, or set up all cloud permissions.
 
@@ -84,8 +111,8 @@ Use two runtime secret files in the app directory, plus a separate authenticatio
 
 | File | Contents |
 | --- | --- |
-| `.env` | `OPENAI_API_KEY` and `REDIS_URL` |
-| `.env.auth` | `FASTAGENT_PASSWORD_HASH`, written by the password helper |
+| `.env` | The model key selected by `fastagent.yaml` (`OPENROUTER_API_KEY` or `OPENAI_API_KEY`) and TLS `REDIS_URL` |
+| `.env.auth` | `FASTAGENT_API_TOKEN` |
 | `.env.railway` | Railway token, only when using Railway |
 
 Use a `rediss://` Redis URL for production. Keep every secret file ignored. Omit empty optional assignments and do not use `.env.example` as a secret file.
@@ -98,7 +125,7 @@ Leave `APP_ORIGIN` unset on the first deploy. Fastagent sets it to the exact pro
 
 [Editable Excalidraw source](diagrams/deployment.excalidraw). Solid arrows show runtime configuration and source flow; dashed arrows show the provider-specific authentication options.
 
-## 5. Deploy to Railway
+## 6. Deploy to Railway
 
 Install the Railway CLI and prepare your workspace ID. Store an account/workspace API token as `RAILWAY_API_TOKEN` in ignored `.env.railway`.
 
@@ -122,7 +149,7 @@ An environment-scoped `RAILWAY_TOKEN` entry in the explicit `--auth-file` only w
 
 Railway provides variables to its build infrastructure as well as the runtime. The bundled Dockerfile does not consume secret build arguments, and upload filtering excludes local secret files. This is not a promise that the platform's build infrastructure never receives the variables.
 
-## 6. Deploy to Cloud Run
+## 7. Deploy to Cloud Run
 
 Install `gcloud`. Prepare your project, billing, required APIs and permissions, and two existing, distinct service accounts: runtime and build.
 
@@ -141,9 +168,9 @@ node /path/to/fastagent/dist/cli.js deploy \
 
 Interactive login opens the native gcloud login flow and requires a terminal. It does not support `--json`.
 
-Review the dry run, then remove `--dry-run` when you want to deploy. Fastagent uses Secret Manager for app secrets. It grants the runtime account access to app-owned secrets and allows public invocation of the password-protected service. It does not automatically grant broad project roles.
+Review the dry run, then remove `--dry-run` when you want to deploy. Fastagent uses Secret Manager for app secrets. It grants the runtime account access to app-owned secrets and allows public invocation of the service. It does not automatically grant broad project roles. Chat itself still requires the bearer token.
 
-## 7. Update, inspect, or delete
+## 8. Update, inspect, or delete
 
 Deployment commands use the current app directory. `--target` defaults to the app name in `fastagent.yaml`.
 
@@ -162,7 +189,7 @@ Deletion requires `destroy ... --yes`. It only deletes resources whose ownership
 
 Cloud Run logs show timestamps and severity only. Application payloads are withheld because they may contain secrets.
 
-## 8. Check health and use the dashboard
+## 9. Check health and use the dashboard
 
 From the app directory:
 
@@ -189,23 +216,27 @@ The interactive dashboard needs a terminal. `dashboard --json` returns cached lo
 These checks mean different things:
 
 - **Deployment status**: the cloud platform's deployment result, queried by `status`. The dashboard initially shows the cached value.
-- **Health**: whether the app and its session service respond.
-- **Chat capability**: whether the model key, model, and tools actually work. Test this manually at the URL.
+- **Health**: whether the app and its history service respond.
+- **Chat capability**: whether the model key, model, and tools actually work. Test this with `fastagent chat`, which makes a real billable request.
 
 `check --chat` is not implemented. It exits before reading secrets or calling a model.
 
-## Sessions, passwords, and limits
+## History, tokens, and limits
 
-Production uses shared Redis sessions. Login and logout work across app instances. Redis outages fail closed with 503 responses; requests recover after reconnection. Redis eviction may invalidate sessions and require login again.
+Redis stores conversation history, not login sessions. One bearer token authorizes every conversation for the app; there is no per-visitor identity, cookie, or CSRF login. If a browser sends `Origin`, it must match `APP_ORIGIN` exactly. Machine clients may omit `Origin`.
 
-Changing the password hash does **not** revoke existing Redis sessions. To invalidate all sessions, change the session namespace consistently across active versions. Use different namespaces for different apps. In local memory mode, restarting clears sessions.
+A completed turn is stored for seven days from the successful commit. A failed or aborted request stores no turn and does not extend retention; a commit already in flight when a request is aborted can still store that completed turn and is then reported as committed rather than as a failure. A conversation holds at most 40 messages and 256 KiB of serialized UTF-8, trimming oldest whole turns. New conversations are rejected once an app reaches 1000 stored conversations. A generation lease lasts 45 seconds. Missing or expired reads and deletes return 404; deleting a conversation with an active generation returns 409; capacity exhaustion returns 429.
 
-There is no saved cross-device chat history or long-term memory. Limits and per-instance throttles reduce abuse but are not hard spending caps. Treat your app code as trusted: upload filtering cannot find every secret embedded in source.
+Redis outages return safe 503 responses and never fall back to memory. Native reconnect restores requests. Changing the token does not delete stored history; use a different history namespace for a different app and keep it stable across versions.
+
+Limits and per-instance throttles reduce abuse but are not hard spending caps. Treat your app code as trusted: upload filtering cannot find every secret embedded in source.
+
+There is no native iMessage integration. A separate Mac-side bridge can call this API over HTTPS with the bearer token; cloud hosts cannot access Apple Messages.
 
 ## What has been verified
 
-Local tests, mocked cloud orchestration, generated app builds, packaging smoke tests, and terminal cleanup have been exercised.
+Local tests, mocked cloud orchestration, generated app builds, packaging smoke tests, and terminal cleanup have been exercised. A `fastagent models` lookup against the live public OpenRouter catalog has been run.
 
-Live cloud deployment, real Redis/Lua, Docker, browser login, fresh registry installation, and Windows behavior still need verification. `--dry-run` checks local inputs only; it does not prove cloud permissions, model availability, or production readiness.
+Live cloud deployment, real Redis/Lua, Docker, fresh registry installation, and Windows behavior still need verification. `--dry-run` checks local inputs only; it does not prove cloud permissions, model availability, or production readiness.
 
 GitHub is optional. Importing existing agents, GitHub templates, and push-to-deploy are not part of this version.

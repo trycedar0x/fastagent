@@ -1,33 +1,35 @@
 import { readFile } from 'node:fs/promises';
 import { parseDocument } from 'yaml';
 import { z } from 'zod';
-import { createModel } from './agent.js';
-import { parsePasswordHash } from './auth.js';
+import { createModel, selectModelApiKey } from './agent.js';
+import { validateApiToken } from './auth.js';
 import type { ChatModel } from './agent.js';
-import type { SessionStore } from './session-store.js';
-import { validateRedisConfig } from './redis-session-store.js';
+import type { HistoryStore } from './history-store.js';
+import { validateRedisConfig } from './redis-history-store.js';
+
+export const DEFAULT_MODEL_REFERENCE = 'openrouter/deepseek/deepseek-v4.1-flash';
 
 const schema = z.strictObject({
   schemaVersion: z.literal(1),
   name: z.string().min(1).max(63).regex(/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/),
   framework: z.literal('openai'),
-  model: z.string().trim().min(1).max(200).regex(/^[^\x00-\x1f\x7f]+$/),
-  deployment: z.strictObject({ access: z.literal('protected') }),
+  model: z.string().trim().min(1).max(270).regex(/^[^\x00-\x1f\x7f]+$/).default(DEFAULT_MODEL_REFERENCE),
+  deployment: z.strictObject({ access: z.literal('token') }),
 });
 
 export interface RuntimeConfig {
   origin: string;
   localDev: boolean;
-  passwordHash: string;
+  apiToken: string;
   model: ChatModel | undefined;
   redisUrl?: string | undefined;
-  sessionNamespace?: string;
+  historyNamespace?: string;
   // Only programmatic tests/custom runtimes inject stores; environment cannot bypass Redis.
-  sessionStore?: SessionStore;
+  historyStore?: HistoryStore;
 }
 
 export function validateRuntimeConfig(config: RuntimeConfig): void {
-  parsePasswordHash(config.passwordHash);
+  validateApiToken(config.apiToken);
   let url: URL;
   try { url = new URL(config.origin); } catch { throw new Error('Invalid APP_ORIGIN configuration.'); }
   if (config.localDev && url.hostname === '[::1]') throw new Error('IPv6 localhost APP_ORIGIN is not supported. Use http://localhost or http://127.0.0.1 with the configured port.');
@@ -35,7 +37,7 @@ export function validateRuntimeConfig(config: RuntimeConfig): void {
       (config.localDev ? url.protocol !== 'http:' || !['localhost', '127.0.0.1'].includes(url.hostname) : url.protocol !== 'https:')) {
     throw new Error('APP_ORIGIN must be an HTTPS origin, or an HTTP localhost origin in explicit local development mode.');
   }
-  if (!config.sessionStore) validateRedisConfig(config.redisUrl, config.sessionNamespace, config.localDev);
+  if (!config.historyStore) validateRedisConfig(config.redisUrl, config.historyNamespace, config.localDev);
 }
 
 export async function loadRuntimeConfig(env: NodeJS.ProcessEnv): Promise<RuntimeConfig> {
@@ -53,10 +55,10 @@ export async function loadRuntimeConfig(env: NodeJS.ProcessEnv): Promise<Runtime
   const config: RuntimeConfig = {
     origin: env.APP_ORIGIN || (localDev ? `http://localhost:${env.PORT ?? '3000'}` : ''),
     localDev,
-    passwordHash: env.FASTAGENT_PASSWORD_HASH ?? '',
-    model: createModel(modelIdentifier, env.OPENAI_API_KEY),
+    apiToken: env.FASTAGENT_API_TOKEN ?? '',
+    model: createModel(modelIdentifier, selectModelApiKey(modelIdentifier, env)),
     redisUrl: env.REDIS_URL,
-    sessionNamespace: env.FASTAGENT_SESSION_NAMESPACE ?? appName,
+    historyNamespace: env.FASTAGENT_HISTORY_NAMESPACE ?? appName,
   };
   validateRuntimeConfig(config);
   return config;

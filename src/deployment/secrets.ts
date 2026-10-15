@@ -29,7 +29,7 @@ export async function loadExplicitSecrets(paths: readonly string[], projectPath:
       const source = buffer.subarray(0, used).toString('utf8');
       const parsed = parseEnv(source);
       sensitive.push(...Object.entries(parsed).flatMap(([key, value]) =>
-        value === undefined || ['APP_ORIGIN', 'FASTAGENT_SESSION_NAMESPACE'].includes(key) ? [] : [value]));
+        value === undefined || ['APP_ORIGIN', 'FASTAGENT_SESSION_NAMESPACE', 'FASTAGENT_HISTORY_NAMESPACE'].includes(key) ? [] : [value]));
       // Runtime secrets are single-line; reject parseEnv's permissive handling of malformed lines.
       const seen = new Set<string>();
       for (const line of source.split(/\r?\n/)) {

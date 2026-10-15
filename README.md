@@ -1,12 +1,12 @@
 # Fastagent
 
-Create a chat agent locally, then deploy it to your own Railway or Google Cloud Run account. Get an HTTPS URL where people can chat with it.
+Create a headless chat agent locally, then deploy it to your own Railway or Google Cloud Run account. Get an HTTPS URL where a client can send messages with a bearer token.
 
-Fastagent provides the project template, chat UI, deployment commands, and a small terminal dashboard. You write the prompt and tools yourself, or ask Claude Code or Codex to help.
+Fastagent provides the project template, the headless HTTP API, deployment commands, and a small terminal dashboard. You write the prompt and tools yourself, or ask Claude Code or Codex to help.
 
-**No GitHub repository is required.** The deployed app is a chat agent, not a coding agent or sandbox. It uses the official OpenAI SDK.
+**No GitHub repository is required.** The deployed app is a chat agent, not a coding agent or sandbox. It uses the official OpenAI SDK for OpenRouter or direct OpenAI.
 
-![Six steps from creating a local app to deploying and inspecting its protected chat URL](docs/diagrams/workflow.svg)
+![Six steps from creating a local app to deploying and inspecting its headless chat API](docs/diagrams/workflow.svg)
 
 [Edit this diagram in Excalidraw](docs/diagrams/workflow.excalidraw) · [How to edit the diagrams](docs/diagrams/README.md)
 
@@ -15,25 +15,29 @@ Fastagent provides the project template, chat UI, deployment commands, and a sma
 Paste this into Claude Code, Codex, or another coding agent. Replace the bracketed description with your idea:
 
 ```text
-Help me build a chat agent using Fastagent.
+Help me build a headless chat agent using Fastagent.
 
 Agent idea: [Describe who it helps, what it should do, and any APIs it needs.]
 
-Install the CLI with npm install -g @0xtryeva/fastagent (Node.js 22+).
-Source: https://github.com/trycedar0x/fastagent.
+Build the CLI from source: clone https://github.com/trycedar0x/fastagent,
+run npm ci and npm run build, then use node dist/cli.js for every command.
+Do not install the published npm 0.1.0, which is the older password-protected
+release and does not provide the headless behavior described here.
 Create the app in a new directory; never overwrite existing files.
 
 Read AGENTS.md, docs/user-guide.md, and .agents/skills/fastagent/SKILL.md
-in the installed package at the npm root -g path under @0xtryeva/fastagent.
+in that checkout.
 Ask me about any missing requirements, then create a separate app with
 Fastagent's OpenAI template. Read the app instructions and the
-fastagent-app skill before editing its prompt, tools, or UI.
+fastagent-app skill before editing its prompt or tools.
 
-Help me configure my API key locally and run the interactive password
-helper. Never ask me to paste secrets into chat, print them, or commit them.
-Keep password protection enabled and do not add shell-execution tools.
-Build and run the app locally so I can try it. Ask before making paid
-model calls yourself.
+The app is headless: one bearer token authorizes every conversation for
+the app, and there is no browser password UI. Help me generate a random
+FASTAGENT_API_TOKEN into an ignored .env.auth file, and put the model key
+selected by fastagent.yaml in an ignored .env file. Never ask me to paste
+secrets into chat, print them, or commit them. Do not add shell-execution
+tools. Build and run the app locally so I can try it with
+the CLI's `chat` command. Ask before making paid model calls yourself.
 
 Once the local app works, ask whether I want Railway or Cloud Run deployment.
 Explain the account, billing, authentication, and TLS Redis requirements.
@@ -44,15 +48,16 @@ was actually verified; a dry run or health check does not prove chat works.
 
 ## Start here
 
-You need Node.js 22+ and npm.
+**Released version:** npm `@0xtryeva/fastagent` is `0.1.0`, the earlier password-protected app. The headless bearer-token behavior described in this README is unreleased source, so build it from this repository. The unscoped `fastagent` npm package is a different, unrelated project.
 
-Install `@0xtryeva/fastagent`, not the unscoped `fastagent` package (an unrelated project).
-
-Install the CLI and create an app:
+You need Node.js 22+ and npm. Build the CLI and create an app:
 
 ```sh
-npm install -g @0xtryeva/fastagent
-fastagent init ./my-agent --framework openai
+git clone https://github.com/trycedar0x/fastagent.git
+cd fastagent
+npm ci
+npm run build
+node dist/cli.js init ./my-agent --framework openai
 ```
 
 This creates a new app in `my-agent/`; existing directories are never overwritten.
@@ -62,18 +67,35 @@ In the generated app:
 ```sh
 cd my-agent
 npm install
-npm run hash-password
 ```
 
-The password helper asks for a password and writes its hash to ignored `.env.auth`. It does not print or save the password.
+Create an ignored `.env.auth` with a random bearer token (at least 32 random bytes encoded as base64url), and an ignored `.env` with the model key selected by `fastagent.yaml`. The default model is `openrouter/deepseek/deepseek-v4.1-flash`, which requires `OPENROUTER_API_KEY`; an `openai/<model>` reference requires `OPENAI_API_KEY` instead.
 
-Create an ignored `.env` file with your `OPENAI_API_KEY`. Then run from the app directory:
+Run from the app directory, using this checkout:
 
 ```sh
-fastagent dev
+node /path/to/fastagent/dist/cli.js dev
 ```
 
-Open the local URL printed by the server and log in. Real chats use your API key and may cost money. Local development does not need Redis or a cloud account; do not expose its HTTP port to the internet.
+The [user guide](docs/user-guide.md) uses the same source-based invocation. A global `fastagent` command exists only after you install a published release, which does not yet contain this behavior.
+
+`dev` builds and starts the headless server on explicit localhost HTTP. It does not serve a browser UI. Local development uses memory history and needs no Redis. Send a message with the headless client:
+
+```sh
+node /path/to/fastagent/dist/cli.js chat --url http://127.0.0.1:3000 --env-file .env.auth --message "Hello"
+```
+
+The bearer token is read only from the explicit `--env-file`, never from a command argument or the inherited shell. Real chats use your API key and may cost money. Do not expose the local HTTP port to the internet.
+
+## Choose a model
+
+`fastagent models` reads the public OpenRouter catalog and prints estimates with a fetch timestamp, source URL, tool support, and unknown prices marked as unknown. These are base token prices: cache-read prices and context-length overrides are not shown, and the price you pay depends on which provider serves the request. It makes no generation call and needs no key.
+
+```sh
+node /path/to/fastagent/dist/cli.js models --search deepseek-v4.1-flash --json
+```
+
+The owner selects the model through `fastagent.yaml` only; there is no visitor model picker. Model context stays independently bounded regardless of conversation length.
 
 ## Build from source instead
 
@@ -97,11 +119,11 @@ For deployment you also need:
 - A TLS Redis URL. You supply and pay for Redis; Fastagent does not create it.
 - For Cloud Run, two existing, different service accounts: one for the app and one for builds.
 
-**Why Redis?** It stores login sessions, not chat history. A shared session store lets all deployed instances recognize the same login and keeps sessions available after an app restart. In-memory sessions would disappear on restart and would not be shared between instances.
+**Why Redis?** In production it stores conversation history, not login sessions. There is no per-visitor login; the bearer token authorizes every conversation for the app. Shared Redis lets all deployed instances read and commit the same history and keeps it available after a restart. In-memory history would disappear on restart and would not be shared between instances.
 
-Redis is only required in production. Local `dev` uses memory. You provide your own TLS-enabled Redis; Fastagent does not provision it. If Redis is unavailable, the app rejects session-dependent requests rather than silently switching to memory.
+Redis is only required in production. Local `dev` uses memory. You provide your own TLS-enabled Redis; Fastagent does not provision it. If Redis is unavailable, the app fails closed with 503 responses and never falls back to memory.
 
-Add `REDIS_URL` to the app's ignored `.env`. Keep the password hash in `.env.auth`; do not copy it into `.env` or a command argument.
+Add `REDIS_URL` and the model key to the app's ignored `.env`. Keep `FASTAGENT_API_TOKEN` in `.env.auth`; do not copy it into `.env` or a command argument.
 
 Deployment commands run **inside the app directory**. Use `fastagent` if installed from npm, or the absolute path to the built `dist/cli.js` when using a source checkout.
 
@@ -109,12 +131,16 @@ Start with `deploy --dry-run`. It checks local inputs without contacting the clo
 
 See the [user guide](docs/user-guide.md) for complete Railway and Cloud Run commands. Leave `APP_ORIGIN` unset on the first deploy; the CLI sets it from the provider URL.
 
+Existing apps created by the earlier password-protected release can still be deployed where safely possible; a generated token-access app is never silently rewritten into an old one.
+
 ## Commands
 
 | Command | Purpose |
 | --- | --- |
 | `init` | Create a new app from the local template |
 | `dev` | Build and run an app on localhost |
+| `models` | Read the public OpenRouter catalog (metadata only) |
+| `chat` | Send one headless message using an explicit token file |
 | `login` | Show Railway token instructions or start explicit Cloud Run login |
 | `deploy` | Create or update a recorded deployment |
 | `status` / `logs` | Inspect a deployment |
@@ -122,18 +148,21 @@ See the [user guide](docs/user-guide.md) for complete Railway and Cloud Run comm
 | `dashboard` | View locally recorded deployments in a terminal |
 | `destroy` | Delete verified app-owned resources, with `--yes` |
 
-Run `fastagent --help` for exact arguments. Most commands support `--json`. `dev`, interactive login, and the interactive dashboard do not; `dashboard --json` returns an offline snapshot.
+Run `node dist/cli.js --help` for exact arguments. Most commands support `--json`. `dev`, interactive login, and the interactive dashboard do not; `dashboard --json` returns an offline snapshot.
 
 ## Current limits
 
-- One model adapter: OpenAI. Deployment backends: Railway and Cloud Run.
-- Password protection is required. Production sessions use Redis.
-- No long-term chat memory, coding tools, sandbox, or automatic GitHub deployment.
-- `check --chat` is not supported. Test chat manually at the app URL.
+- One model adapter: the official OpenAI SDK, aimed at OpenRouter or direct OpenAI. Deployment backends: Railway and Cloud Run.
+- Bearer-token access is required. Redis stores conversation history in production, not login sessions.
+- Bounded history (7-day sliding expiry, 1000 conversations per app, 40 messages and 256 KiB per conversation) and bounded model context (20 messages, 16,000 characters).
+- No browser UI, per-visitor identity, long-term memory, coding tools, sandbox, or automatic GitHub deployment.
+- `check --chat` is not supported. Test chat with the CLI's `chat` command, which makes a real billable request.
 - Cloud Run logs show metadata, not application message bodies.
 - Deleting an app may leave shared resources and costs behind.
+- There is no native iMessage integration. A separate Mac-side bridge can call this API, and cloud hosts cannot access Apple Messages.
 
-Local tests and mocked cloud tests pass. A fresh npm installation has been checked, including creating an app with the installed CLI. **Live cloud deployment, real Redis/Lua, Docker, browser login, and Windows behavior still need verification.** Mock tests are not proof of a successful cloud deployment.
+Local tests and mocked cloud tests pass. A fresh npm installation has been checked, including creating an app with the installed CLI. **Live cloud deployment, real Redis/Lua, Docker, browser behavior, and Windows still need verification.** Mock tests are not proof of a successful cloud deployment.
+
 
 ## For coding assistants
 

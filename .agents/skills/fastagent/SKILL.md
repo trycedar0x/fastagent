@@ -1,11 +1,11 @@
 ---
 name: fastagent
-description: Operate the Fastagent CLI to scaffold, run, check, and deploy a protected chat app on the user's own Railway or Cloud Run account. Use when the user asks to init, dev, login, deploy, status, logs, destroy, check, or dashboard a Fastagent project, or to drive `fastagent` / `node dist/cli.js`.
+description: Operate the Fastagent CLI to scaffold, run, check, and deploy a headless bearer-token chat app on the user's own Railway or Cloud Run account. Use when the user asks to init, dev, models, chat, login, deploy, status, logs, destroy, check, or dashboard a Fastagent project, or to drive `fastagent` / `node dist/cli.js`.
 ---
 
 # Operate Fastagent
 
-Use this skill to create, run, deploy, inspect, or check a Fastagent app. Fastagent deploys protected chat apps to user-owned Railway or Cloud Run accounts. It is not a coding agent or sandbox.
+Use this skill to create, run, deploy, inspect, or check a Fastagent app. Fastagent deploys headless, bearer-token chat apps to user-owned Railway or Cloud Run accounts. It is not a coding agent or sandbox, and new apps have no browser UI.
 
 ## Find the CLI
 
@@ -30,7 +30,7 @@ Start deployment with `--dry-run`. Remove it only after the user explicitly auth
 
 Also obtain permission before destructive commands, interactive login, publication, or paid model calls. Never describe a dry run or mock test as a live deployment.
 
-Do not read secrets into chat, print them, or place them in command arguments. Deployment reads runtime secrets only from explicit `--env-file` paths and Railway tokens only from `--auth-file`, not from the shell. Local `dev` is different: the app loads its ignored `.env` and `.env.auth` files automatically. Cloud Run uses native gcloud authentication.
+Do not read secrets into chat, print them, or place them in command arguments. Deployment and `chat` read runtime secrets only from explicit `--env-file` paths and Railway tokens only from `--auth-file`, not from the shell. Local `dev` is different: the app loads its ignored `.env` and `.env.auth` files automatically. Cloud Run uses native gcloud authentication.
 
 Do not expose unprotected chat or tunnel local development.
 
@@ -43,24 +43,31 @@ Do not expose unprotected chat or tunnel local development.
 - Only `openai` is supported. Init needs no model key, GitHub, Redis, Docker, or cloud account.
 - Existing projects are never merged or overwritten.
 
+A new app is headless with bearer-token access. It does not serve a browser password UI or `/api/login`.
+
 If the user wants local chat:
 
 1. Install dependencies in the generated app.
-2. Run `npm run hash-password` in an interactive terminal.
-3. Have the user put `OPENAI_API_KEY` in ignored `.env`.
+2. Have the user generate a random `FASTAGENT_API_TOKEN` (at least 32 random bytes, base64url) into ignored `.env.auth`.
+3. Have the user put the model key selected by `fastagent.yaml` into ignored `.env`.
 4. Run `dev <directory>`; `--install` separately authorizes dependency installation.
+5. Send a message with `fastagent chat --url <origin> --env-file .env.auth --message "..."`.
 
-The helper writes a hash to ignored `.env.auth`; never invent a hash or copy it to a command argument. Local development uses memory sessions, needs no Redis, and has no hot reload.
+The token is read only from the explicit `--env-file`; never invent one or pass it as a command argument. Local development uses memory history, needs no Redis, binds to IPv4 loopback, and has no hot reload.
 
-Use the `fastagent-app` skill for prompt/tool/UI edits.
+Use the `fastagent-app` skill for prompt/tool edits.
+
+## Choose a model
+
+`fastagent models [--search <text>] [--limit <n>] [--tools] [--json]` reads the public OpenRouter catalog. It needs no key, makes no generation call, and never incurs model charges. It reports estimates with a fetch timestamp, source URL, tool support, and unknown prices marked unknown. Documented tilde-prefixed vendor aliases are accepted. The owner selects the model in `fastagent.yaml`; there is no visitor model picker.
 
 ## Deploy
 
 Run lifecycle commands inside the app directory. `--target` defaults to the configured app name.
 
-For production, `.env` supplies `OPENAI_API_KEY` and TLS `REDIS_URL`; `.env.auth` supplies the password hash. Pass both explicitly. Local secret files must be root `.env` or `.env.*`, not `.env.example`; omit empty assignments.
+For production, `.env` supplies the model key selected by `fastagent.yaml` (`OPENROUTER_API_KEY` or `OPENAI_API_KEY`) and TLS `REDIS_URL`; `.env.auth` supplies `FASTAGENT_API_TOKEN`. Pass both explicitly. Local secret files must be root `.env` or `.env.*`, not `.env.example`; omit empty assignments. Do not set both model keys.
 
-Leave `APP_ORIGIN` unset on first deployment. The CLI sets the exact provider origin. A supplied update origin must match the recorded URL. Preserve the recorded session namespace.
+Leave `APP_ORIGIN` unset on first deployment. The CLI sets the exact provider origin. A supplied update origin must match the recorded URL. Preserve the recorded history namespace.
 
 ### Railway
 
@@ -98,11 +105,11 @@ Deletion requires user permission, `--yes`, and verified ownership. Shared proje
 
 Do not blindly retry uncertain mutations or delete resources based only on their name.
 
-## Health and dashboard
+## Health and chat
 
-`check` reads the current app's saved target and requests HTTPS `/healthz` only. Choose `--provider` if both providers are recorded. Health does not certify model keys or tools.
+`check` reads the current app's saved target and requests HTTPS `/healthz` only. Choose `--provider` if both providers are recorded. Health does not certify model keys or tools; it never calls a model.
 
-`check --chat` is unsupported and exits before secret/network access. Do not improvise a paid probe.
+`check --chat` is unsupported and exits before secret/network access. To test chat, use `fastagent chat`, which sends one real, billable request with a message or stdin and can resume a conversation with `--conversation`.
 
 The dashboard lists local records. It does not discover cloud apps. Keys: arrows select, Enter opens the URL, R refreshes, L shows logs, Q quits. Status/log actions need explicit matching provider settings and auth. Automatic polling is health-only; displayed deployment status is initially cached.
 

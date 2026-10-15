@@ -76,7 +76,7 @@ test('CLI: text init identifies runnable runtime and text errors use stderr', as
   const result = cli(['init', 'agent'], cwd);
   assert.equal(result.status, 0);
   assert.equal(result.stderr, '');
-  assert.match(result.stdout, /Runnable protected chat template/);
+  assert.match(result.stdout, /Runnable headless chat template/);
   const failure = cli(['init', 'agent'], cwd);
   assert.equal(failure.status, 1);
   assert.equal(failure.stdout, '');

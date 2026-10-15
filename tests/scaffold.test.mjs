@@ -52,7 +52,7 @@ test('scaffold: blank environment placeholders and local/container secret exclus
   const cwd = await temporaryDirectory(t);
   const result = await initProject({ directory: 'agent', cwd });
   const example = await readFile(join(result.directory, '.env.example'), 'utf8');
-  assert.deepEqual(example.split('\n').filter((line) => line && !line.startsWith('#')), ['OPENAI_API_KEY=', 'FASTAGENT_PASSWORD_HASH=', 'APP_ORIGIN=', 'REDIS_URL=']);
+  assert.deepEqual(example.split('\n').filter((line) => line && !line.startsWith('#')), ['OPENROUTER_API_KEY=', 'FASTAGENT_API_TOKEN=', 'APP_ORIGIN=', 'REDIS_URL=']);
   for (const file of ['.gitignore', '.dockerignore']) {
     const lines = (await readFile(join(result.directory, file), 'utf8')).split('\n');
     for (const pattern of ['.env', '.env.*', '!.env.example', '*.pem', '*.key', 'credentials*.json']) {

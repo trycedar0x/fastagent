@@ -2,13 +2,14 @@ import { readFile } from 'node:fs/promises';
 import { FastagentError } from '../../errors.js';
 import { redactProcessOutput } from '../process.js';
 import { createDeploymentRecord, deploymentKey, validateDeploymentRecord, type DeploymentRecord } from '../state.js';
-import { validateCloudEnvironment, validateHttpsOrigin, validatePreflightEnvironment,
-  type DeploymentProvider, type DeployInput, type DestroyInput, type PreflightEnvironment,
+import { isApprovedDockerfile } from '../dockerfiles.js';
+import { redisNamespace, redisNamespaceVariable, runtimeSecretKeys, secretValue, validateCloudEnvironment, validateHttpsOrigin, validatePreflightEnvironment,
+  type CloudEnvironment, type DeploymentProvider, type DeployInput, type DestroyInput, type PreflightEnvironment,
   type ProviderContext, type ProviderStatus } from '../types.js';
 
 const API = 'https://backboard.railway.com/graphql/v2';
 const MARKER = 'FASTAGENT_OWNERSHIP_MARKER';
-const secretKeys = ['FASTAGENT_PASSWORD_HASH', 'OPENAI_API_KEY', 'REDIS_URL'] as const;
+const nonSecretVariables = ['APP_ORIGIN', 'FASTAGENT_SESSION_NAMESPACE', 'FASTAGENT_HISTORY_NAMESPACE', 'PORT'];
 const idPattern = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const failure = (code: string) => new FastagentError(code,
   'Railway operation could not be verified. Inspect the recoverable checkpoint and remote resources before retrying; no automatic creation retry is authorized.');
@@ -286,10 +287,27 @@ export function createRailwayProvider(options: RailwayOptions): DeploymentProvid
     if (['FAILED', 'CRASHED', 'REMOVED', 'REMOVING', 'SKIPPED'].includes(String(status))) return 'failed';
     return 'deploying';
   }
+  function remoteEnvironment(variables: Record<string, unknown>): CloudEnvironment {
+    const password = variables.FASTAGENT_PASSWORD_HASH !== undefined;
+    const token = variables.FASTAGENT_API_TOKEN !== undefined;
+    if (password && token) throw failure('RAILWAY_UNSAFE_REMOTE_ENV');
+    if (token) {
+      if (variables.FASTAGENT_SESSION_NAMESPACE !== undefined || variables.FASTAGENT_PASSWORD_HASH !== undefined) throw failure('RAILWAY_UNSAFE_REMOTE_ENV');
+      const modelKeys = ['OPENAI_API_KEY', 'OPENROUTER_API_KEY'].filter((key) => variables[key] !== undefined);
+      if (modelKeys.length !== 1) throw failure('RAILWAY_UNSAFE_REMOTE_ENV');
+      return validateCloudEnvironment({
+        FASTAGENT_API_TOKEN: variables.FASTAGENT_API_TOKEN,
+        ...(variables.OPENAI_API_KEY !== undefined ? { OPENAI_API_KEY: variables.OPENAI_API_KEY } : {}),
+        ...(variables.OPENROUTER_API_KEY !== undefined ? { OPENROUTER_API_KEY: variables.OPENROUTER_API_KEY } : {}),
+        REDIS_URL: variables.REDIS_URL, APP_ORIGIN: variables.APP_ORIGIN,
+        FASTAGENT_HISTORY_NAMESPACE: variables.FASTAGENT_HISTORY_NAMESPACE,
+      });
+    }
+    return validateCloudEnvironment(Object.fromEntries(['FASTAGENT_PASSWORD_HASH', 'OPENAI_API_KEY', 'REDIS_URL', 'APP_ORIGIN', 'FASTAGENT_SESSION_NAMESPACE'].map((key) => [key, variables[key]])));
+  }
   function validateRemoteEnvironment(variables: Record<string, unknown>, record: DeploymentRecord) {
-    const selected = Object.fromEntries([...secretKeys, 'APP_ORIGIN', 'FASTAGENT_SESSION_NAMESPACE'].map((key) => [key, variables[key]]));
-    const environment = validateCloudEnvironment(selected);
-    if (environment.APP_ORIGIN !== record.url || environment.FASTAGENT_SESSION_NAMESPACE !== record.sessionNamespace) throw failure('RAILWAY_ORIGIN_MISMATCH');
+    const environment = remoteEnvironment(variables);
+    if (environment.APP_ORIGIN !== record.url || redisNamespace(environment) !== record.sessionNamespace) throw failure('RAILWAY_ORIGIN_MISMATCH');
   }
   async function healthy(context: ProviderContext, record: DeploymentRecord) {
     if (!record.url) return false;
@@ -312,16 +330,16 @@ export function createRailwayProvider(options: RailwayOptions): DeploymentProvid
     if (record) {
       record = recordFor(input, record);
       if (record.status === 'destroying') throw failure('RAILWAY_TARGET_MISMATCH');
-      if (record.sessionNamespace !== environment.FASTAGENT_SESSION_NAMESPACE) throw failure('RAILWAY_NAMESPACE_MISMATCH');
+      if (record.sessionNamespace !== redisNamespace(environment)) throw failure('RAILWAY_NAMESPACE_MISMATCH');
     } else {
       if (options.credentials.scope !== 'account') throw failure('RAILWAY_ACCOUNT_REQUIRED');
-      record = { ...createDeploymentRecord(input.selector), sessionNamespace: environment.FASTAGENT_SESSION_NAMESPACE,
+      record = { ...createDeploymentRecord(input.selector), sessionNamespace: redisNamespace(environment),
         selectors: { project: options.workspaceId } };
     }
     // Validate the supplied stage independently for the controlled Dockerfile boundary.
     const approved = await readFile(new URL('../../../templates/openai/Dockerfile', import.meta.url), 'utf8');
     const staged = await readFile(`${input.source.directory}/Dockerfile`, 'utf8');
-    if (approved.trim() !== staged.replaceAll('\r\n', '\n').trim() || !input.source.files.includes('.railwayignore')) throw failure('RAILWAY_SOURCE_UNSUPPORTED');
+    if (!isApprovedDockerfile(staged, approved) || !input.source.files.includes('.railwayignore')) throw failure('RAILWAY_SOURCE_UNSUPPORTED');
     const profile = await prepare(input, environment);
     const save = async (changes: Partial<DeploymentRecord>) => { record = await input.state.write({ ...record!, ...changes }); return record; };
     if (!record.revision) await save({});
@@ -367,10 +385,11 @@ export function createRailwayProvider(options: RailwayOptions): DeploymentProvid
       if (!origin || (environment.APP_ORIGIN && environment.APP_ORIGIN !== origin)) throw failure('RAILWAY_ORIGIN_MISMATCH');
       await save({ url: origin, status: 'pending' });
       const full = validateCloudEnvironment({ ...environment, APP_ORIGIN: origin });
-      const secrets = secretKeys.map((key) => full[key]);
-      for (const key of secretKeys) await command(input,
-        ['variable', 'set', key, '--stdin', '--skip-deploys', ...serviceScoped(record)], 'mutate', full[key], secrets);
-      await command(input, ['variable', 'set', `APP_ORIGIN=${origin}`, `FASTAGENT_SESSION_NAMESPACE=${record.sessionNamespace}`, 'PORT=8080',
+      const keys = runtimeSecretKeys(full);
+      const secrets = keys.map((key) => secretValue(full, key));
+      for (const key of keys) await command(input,
+        ['variable', 'set', key, '--stdin', '--skip-deploys', ...serviceScoped(record)], 'mutate', secretValue(full, key), secrets);
+      await command(input, ['variable', 'set', `APP_ORIGIN=${origin}`, `${redisNamespaceVariable(full)}=${record.sessionNamespace}`, 'PORT=8080',
         ...serviceScoped(record), '--skip-deploys'], 'mutate', undefined, secrets);
       const identities = { serviceId: resource(record, 'service'), environmentId: resource(record, 'environment') };
       const settings = { numReplicas: 1, healthcheckPath: '/healthz', healthcheckTimeout: 300 };
@@ -427,7 +446,7 @@ export function createRailwayProvider(options: RailwayOptions): DeploymentProvid
       await cliReady(context);
       await schema(context.signal);
       const variables = await verify(context, record);
-      const secrets = Object.entries(variables).filter(([key]) => !['APP_ORIGIN', 'FASTAGENT_SESSION_NAMESPACE', 'PORT'].includes(key))
+      const secrets = Object.entries(variables).filter(([key]) => !nonSecretVariables.includes(key))
         .map(([, value]) => typeof value === 'string' ? value : '').filter(Boolean);
       const output = await command(context, ['logs', resource(record, 'build'), ...scoped(record), '--lines', String(logLines), '--json'], 'read', undefined, secrets);
       for (const line of output.split(/\r?\n/).filter(Boolean)) {

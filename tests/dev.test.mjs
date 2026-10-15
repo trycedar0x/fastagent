@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import childProcess from 'node:child_process';
-import { scryptSync } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { EventEmitter, once } from 'node:events';
 import { readdir, symlink } from 'node:fs/promises';
 import { syncBuiltinESMExports } from 'node:module';
@@ -58,11 +58,13 @@ test('dev/CLI: generated app announces readiness after listening and SIGTERM shu
   const cwd = await temporaryDirectory(t);
   const project = await initProject({ directory: 'agent', cwd });
   await symlink(join(root, 'node_modules'), join(project.directory, 'node_modules'), 'dir');
-  const probe = createServer(); await new Promise(resolve => probe.listen(0, '127.0.0.1', resolve));
+  const probe = createServer();
+  // Guard the probe so a failure before its explicit close cannot leak a listening handle.
+  t.after(() => new Promise(resolve => { if (probe.listening) probe.close(() => resolve()); else resolve(); }));
+  await new Promise(resolve => probe.listen(0, '127.0.0.1', resolve));
   const port = probe.address().port; await new Promise(resolve => probe.close(resolve));
-  const salt = Buffer.alloc(16, 1);
-  const hash = `scrypt-v1$${salt.toString('hex')}$${scryptSync('test-password', salt, 64).toString('hex')}`;
-  const child = spawn(process.execPath, [cli, 'dev', project.directory], { cwd, env: { PATH: process.env.PATH, PORT: String(port), FASTAGENT_PASSWORD_HASH: hash }, stdio: ['ignore', 'pipe', 'pipe'] });
+  const apiToken = randomBytes(32).toString('base64url');
+  const child = spawn(process.execPath, [cli, 'dev', project.directory], { cwd, env: { PATH: process.env.PATH, PORT: String(port), FASTAGENT_API_TOKEN: apiToken }, stdio: ['ignore', 'pipe', 'pipe'] });
   t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); });
   let stdout = ''; let stderr = '';
   child.stderr.on('data', chunk => { stderr += chunk; });
@@ -70,15 +72,14 @@ test('dev/CLI: generated app announces readiness after listening and SIGTERM shu
     const timer = setTimeout(() => reject(new Error(`readiness timeout: ${stdout} ${stderr}`)), 10000);
     child.stdout.on('data', chunk => {
       stdout += chunk;
-      if (stdout.includes('Chat server ready.')) { clearTimeout(timer); resolve(); }
+      if (stdout.includes('Headless chat service ready.')) { clearTimeout(timer); resolve(); }
     });
     child.once('exit', code => { clearTimeout(timer); reject(new Error(`early exit ${code}: ${stderr}`)); });
   });
-  assert.equal(stdout, 'Chat server ready.\n');
-  assert.ok(!stdout.includes(hash) && !stderr.includes(hash));
+  assert.equal(stdout, 'Headless chat service ready.\n');
+  assert.ok(!stdout.includes(apiToken) && !stderr.includes(apiToken));
   const health = await fetch(`http://127.0.0.1:${port}/healthz`); assert.deepEqual(await health.json(), { ok: true });
-  const cookie = (await fetch(`http://127.0.0.1:${port}/api/session`)).headers.get('set-cookie');
-  assert.match(cookie, /^fastagent-local=/); assert.doesNotMatch(cookie, /; Secure/);
+  assert.equal((await fetch(`http://127.0.0.1:${port}/api/session`)).status, 404);
   const exited = once(child, 'exit'); child.kill('SIGTERM');
   const [code] = await exited; assert.equal(code, 0);
   await assert.rejects(fetch(`http://127.0.0.1:${port}/healthz`));

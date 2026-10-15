@@ -1,6 +1,6 @@
 # Your chat agent
 
-This is a runnable Node.js 22+ app using the official OpenAI SDK. It runs independently of the CLI. One server serves the browser UI, password-protected chat, and health endpoint.
+This is a runnable Node.js 22+ headless app using the official OpenAI SDK. It runs independently of the CLI. One server exposes bearer-token chat and a health endpoint. It does not serve a browser password UI.
 
 ## Run locally
 
@@ -8,15 +8,16 @@ In this app directory:
 
 ```sh
 npm install
-npm run hash-password
 ```
 
-Enter a password. The helper hides input and creates ignored `.env.auth` with a salted scrypt hash, not plaintext. It refuses to overwrite an existing file.
+Create ignored `.env` with the model key selected by `fastagent.yaml`. The default model is `openrouter/deepseek/deepseek-v4.1-flash`, which requires `OPENROUTER_API_KEY`. An `openai/<model>` reference requires `OPENAI_API_KEY` instead. Do not set both.
 
-Create an ignored `.env` with `OPENAI_API_KEY`. Start the app with your Fastagent CLI:
+Create ignored `.env.auth` with `FASTAGENT_API_TOKEN`. Use at least 32 random bytes encoded as base64url. The token authorizes every conversation for this app. It is not a per-user login.
+
+Start the app with your Fastagent CLI:
 
 ```sh
-fastagent dev
+node /path/to/fastagent/dist/cli.js dev
 ```
 
 If Fastagent is not on PATH, use the absolute path to its built `dist/cli.js`:
@@ -25,22 +26,29 @@ If Fastagent is not on PATH, use the absolute path to its built `dist/cli.js`:
 node /path/to/fastagent/dist/cli.js dev
 ```
 
-Open the printed localhost URL and log in. Local development uses memory sessions and needs no Redis. Real chats can cost money.
+The server prints readiness on localhost. Local development uses memory history and needs no Redis. Real chats can cost money.
 
 Stop with Ctrl-C and restart after edits; there is no hot reload. Do not expose the local HTTP port to the internet. Dependency installation is not automatic unless you pass `--install`.
 
+Send a message with the CLI, from the app directory or with an explicit token file:
+
+```sh
+node /path/to/fastagent/dist/cli.js chat --url http://127.0.0.1:3000 --env-file .env.auth --message "Hello"
+```
+
+The token is read only from that file, never from the command line or the shell.
+
 ## Edit the agent
 
-- `src/agent.ts`: prompt and OpenAI model adapter.
+- `src/agent.ts`: prompt and model adapter.
 - `src/tools.ts`: bounded predefined tools; the sample converts temperatures.
-- `fastagent.yaml`: app name and `model: openai/<model>`.
-- `public/`: chat UI.
+- `fastagent.yaml`: app name and `model: openrouter/<vendor>/<model>` or `openai/<model>`.
 
-Only OpenAI is supported. A configured model ID does not prove the model is available to your account.
+The adapter is the official OpenAI SDK, aimed at OpenRouter or OpenAI. A configured model ID does not prove the model is available to your account. Do not put an arbitrary base URL in configuration.
 
-Keep tools separate from the HTTP server and authentication. Do not add shell access or arbitrary code execution. Render user/model output as text, never HTML.
+Keep tools separate from the HTTP server and authentication. Do not add shell access or arbitrary code execution.
 
-Chat history lives in the current browser page and is sent with each request. There is no saved history or long-term memory.
+There is no browser UI in a newly generated app. A separate client, including a Mac-side bridge, can call the HTTP API. Cloud hosts cannot access Apple Messages, and this app does not integrate with iMessage.
 
 ## Deploy
 
@@ -51,70 +59,70 @@ npm run typecheck
 npm run build
 ```
 
-Use Fastagent's deployment commands from this directory. Pass `--env-file .env --env-file .env.auth`; keep the password hash in its original file.
+Use Fastagent's deployment commands from this directory. Pass `--env-file .env --env-file .env.auth`.
 
 Production requires:
 
 | Setting | Source |
 | --- | --- |
-| `FASTAGENT_PASSWORD_HASH` | `.env.auth` |
-| `OPENAI_API_KEY` | `.env` |
+| `FASTAGENT_API_TOKEN` | `.env.auth` |
+| `OPENROUTER_API_KEY` or `OPENAI_API_KEY` | `.env`, matching the model reference |
 | TLS `REDIS_URL` | `.env`; you supply Redis |
 | Exact HTTPS `APP_ORIGIN` | Set by the deployment CLI from the provider URL |
 | `PORT` | Hosting platform |
-| Session namespace | Set by the CLI; stable across app versions |
+| History namespace | Set by the CLI; stable across app versions |
 
 Do not set `FASTAGENT_LOCAL_DEV` in production. Leave `APP_ORIGIN` unset on first deployment; do not invent a URL. A supplied update origin must match the recorded URL exactly.
 
-Redis outages return safe 503 errors, never memory fallback. Native reconnect restores requests. Builds do not connect to Redis.
+Redis stores conversation history, not login sessions. Outages return safe 503 errors, never memory fallback. Native reconnect restores requests. Builds do not connect to Redis.
 
 The Dockerfile runs as a non-root user and copies only known app inputs. Keep env files and credentials out of source and images. Upload filtering cannot detect every secret embedded in code. Fastagent deployment currently expects its bundled Dockerfile.
 
-## Passwords and sessions
+## Bearer token and history
 
-Cookies are HttpOnly, SameSite=Strict, host-only, and Secure in production. Login, chat, and logout check Origin and CSRF tokens.
+One token authorizes all conversations for this app. There is no user identity, cookie, or CSRF login. If a browser sends `Origin`, it must match `APP_ORIGIN` exactly. Machine clients may omit `Origin`.
 
-Production sessions use shared Redis and survive app restarts. Only token hashes are stored. Authenticated sessions expire after one hour; anonymous sessions after five minutes. Rotation and logout are atomic across instances.
+Completed turns are stored for seven days from the successful commit. A failed or aborted request stores no turn and does not extend retention; a commit already in flight when a request is aborted can still store that completed turn and is then reported as committed rather than as a failure. A conversation holds at most 40 messages and 256 KiB of serialized UTF-8, trimming oldest whole turns. New conversations are rejected at 1000 per app. A generation lease lasts 45 seconds. Missing or expired reads and deletes return 404. Deleting an active conversation returns 409.
 
-Logout stops future authorization, not a chat already in progress. Changing the password hash alone does not revoke existing sessions. A coordinated namespace change invalidates old sessions. Different apps need different namespaces.
+Model context is a separate bound: the complete request sent to the model is at most 20 messages and 16,000 characters including the system prompt and tool turns. Older whole turns are dropped to fit, and a request that cannot fit fails without calling the model.
 
-Redis eviction or inconsistent session indexes may require users to log in again. Local memory sessions disappear on restart.
+Changing the token does not delete stored history. Use a different history namespace for a different app. Do not reuse a namespace.
 
 ## HTTP API
 
 | Endpoint | Behavior |
 | --- | --- |
-| `GET /healthz` | `200 {"ok":true}` when ready; 503 during session-store outages; no model call |
-| `GET /api/session` | Returns `authenticated`, a CSRF token, and a session cookie when needed |
-| `POST /api/login` | Accepts `{"password":"..."}`; rotates cookie and CSRF token on success |
-| `POST /api/chat` | Accepts bounded user/assistant messages; last message must be from the user |
-| `POST /api/logout` | Revokes the authenticated session and clears its cookie |
+| `GET /healthz` | `200 {"ok":true}` when ready; 503 during history-store outages; no model call |
+| `POST /api/chat` | Bearer token plus `{"message":"...","conversationId?":"..."}`; streams NDJSON |
+| `GET /api/conversations/:id` | Bearer token; returns stored messages, or 404 |
+| `DELETE /api/conversations/:id` | Bearer token; deletes stored history, or 404; 409 if a generation lease is active |
 
-Login requires the pre-login cookie, exact Origin, and `X-CSRF-Token`. Chat/logout require the authenticated cookie, Origin, and its current CSRF token. Errors are generic.
+Every `/api/*` endpoint requires `Authorization: Bearer <FASTAGENT_API_TOKEN>`, including reading and deleting stored history; `GET /healthz` is the only unauthenticated endpoint. Query tokens, cookies, and duplicate authorization fields are rejected. Unknown supplied conversation IDs return 404 before model work. The server assigns new IDs.
 
 Chat uses UTF-8 `application/x-ndjson`: one JSON object per line.
 
 ```json
+{"type":"conversation","conversationId":"..."}
 {"type":"delta","text":"Hello"}
 {"type":"done"}
 ```
 
-A failed stream ends with an error frame instead of done. Network chunks may split JSON lines or UTF-8 characters. Partial output followed by an error is not a complete answer. Tool activity stays on the server.
+A failed stream ends with an error frame instead of done. Partial output followed by an error is not a complete answer and is not stored. Tool activity stays on the server. Empty, whitespace-only, and reasoning-only completions fail without disclosing reasoning.
 
 ## Limits
 
-The defaults limit bodies to 32 KiB, context to 20 messages and 16,000 characters total, chats to four concurrent requests, and each chat to 30 seconds. Agent loops allow three model/tool steps, up to 1,024 output tokens per step and 64 KiB streamed text.
+The defaults limit bodies to 32 KiB, stored history as described above, the complete model request to 20 messages and 16,000 characters, chats to four concurrent requests per instance, and each chat to 30 seconds. Agent loops allow three model/tool steps, up to 1,024 output tokens per step and 64 KiB streamed text.
 
-Login throttling and concurrency limits are per instance. Proxies may group users. These controls are not hard spending caps; cancellation may not prevent all provider charges.
+These controls are not hard spending caps. Cancellation may not prevent all provider charges.
 
-A missing model key can leave health working while chat fails. Test real chat manually when authorized; health does not certify the model or tools.
+A missing model key can leave health working while chat fails. Test real chat only when authorized; health does not certify the model or tools.
 
 ## Tests and verification
 
-Run `npm run typecheck` and `npm run build`. Offline tests can inject a `ChatModel` and async `sessionStore` through `createRuntime`. Production startup has no Redis bypass.
+Run `npm run typecheck` and `npm run build`. Offline tests can inject a `ChatModel` and `HistoryStore` through `createRuntime`. Production startup has no Redis bypass.
 
 Do not use real keys or paid models in tests. The Fastagent repository has an opt-in `npm run test:redis`; this is not a generated-app command.
 
-Live cloud deployment, real Redis/Lua, Docker, browser, fresh registry installation, and Windows behavior still need verification.
+Live cloud deployment, real Redis/Lua, Docker, fresh registry installation, and Windows behavior still need verification.
 
 A successful local build is not a cloud deployment integration test. Verify the actual cloud deployment separately before relying on it.

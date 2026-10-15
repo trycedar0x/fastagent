@@ -1,7 +1,7 @@
 {
   "name": "@0xtryeva/fastagent",
   "version": "0.1.0",
-  "description": "Create, deploy, and monitor protected chat agents on Railway and Cloud Run",
+  "description": "Create, deploy, and monitor headless bearer-token chat agents on Railway and Cloud Run",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -32,7 +32,7 @@
   "scripts": {
     "build": "tsc && node scripts/make-executable.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build && node --test tests/*.test.mjs",
+    "test": "npm run build && node --test --test-timeout=60000 --test-force-exit tests/*.test.mjs",
     "test:redis": "node scripts/test-redis.mjs",
     "prepack": "npm run build"
   },

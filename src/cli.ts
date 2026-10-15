@@ -1,18 +1,24 @@
 #!/usr/bin/env node
 import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { FastagentError } from './errors.js';
+import { sendChat, validateChatMessage } from './chat/client.js';
 import { initProject } from './scaffold/init.js';
 import { devProject } from './dev/dev.js';
 import { executeDeployment, formatDeploymentResult, type DeploymentCommand } from './deployment/service.js';
+import { loadExplicitSecrets } from './deployment/secrets.js';
 import { executeCheck, localSnapshot, type RecordActionOptions } from './checks/service.js';
 import { runDashboard } from './dashboard/dashboard.js';
+import { fetchOpenRouterCatalog, OpenRouterCatalogError, type OpenRouterCatalog } from './models/openrouter.js';
 
-const help = `Fastagent — local protected chat applications
+const help = `Fastagent — headless bearer-token chat applications
 
 Usage:
   fastagent init <directory> [--name <name>] [--framework openai] [--json]
   fastagent dev [directory] [--install]
+  fastagent models [--search <text>] [--limit <n>] [--tools] [--json]
+  fastagent chat --url <origin> --env-file <file> [--env-file <file> ...] [--message <text>] [--conversation <id>] [--json]
   fastagent login --provider railway|cloudrun [--interactive] [--json]
   fastagent deploy --provider railway|cloudrun [--target <name>] [provider flags]
     --env-file <file> [--env-file <file> ...] [--dry-run] [--json]
@@ -25,8 +31,13 @@ Usage:
 
 init requires a new destination with an existing, non-symlink parent.
 Name defaults to the directory basename; framework defaults to openai.
-The only model adapter is the official OpenAI SDK. The Vercel AI SDK is not supported.
-init and dev are implemented, alongside login/deploy/status/logs/destroy.
+New apps use deployment.access token and the official OpenAI SDK. The Vercel AI SDK is not supported.
+The product default model is openrouter/deepseek/deepseek-v4.1-flash. Existing protected apps are not rewritten.
+init and dev are implemented, alongside models/chat and login/deploy/status/logs/destroy.
+models reads the public OpenRouter catalog. Prices are estimates with timestamps and source URLs; unknown prices stay unknown.
+chat is headless. It reads FASTAGENT_API_TOKEN only from explicit --env-file paths, never from arguments or the shell.
+Pass --message or pipe stdin. --conversation resumes a server ID. URL must be HTTPS or explicit localhost HTTP.
+Redirects are refused so the bearer token cannot be sent to another origin. Chat can incur model charges.
 Deployment commands use the current directory; target defaults to fastagent.yaml name.
 Railway flags: --workspace <id> --auth-file <ignored-env-file>
   Account: RAILWAY_API_TOKEN. Project token: RAILWAY_TOKEN plus
@@ -34,8 +45,10 @@ Railway flags: --workspace <id> --auth-file <ignored-env-file>
 Cloud Run flags: --project <id> --region <region>
   --runtime-account <email> --build-account <email> (existing distinct identities).
 Runtime secrets are loaded ONLY from explicit repeatable --env-file (Node env syntax).
-Required: FASTAGENT_PASSWORD_HASH, OPENAI_API_KEY, TLS REDIS_URL.
-Optional: exact APP_ORIGIN only after a URL is recorded; first deploy omits it and the CLI sets the provider origin. Optional stable FASTAGENT_SESSION_NAMESPACE.
+Token apps require FASTAGENT_API_TOKEN, the model key selected by fastagent.yaml, and TLS REDIS_URL.
+Existing protected apps still require FASTAGENT_PASSWORD_HASH, OPENAI_API_KEY, and TLS REDIS_URL.
+Optional: exact APP_ORIGIN only after a URL is recorded; first deploy omits it and the CLI sets the provider origin.
+Optional stable FASTAGENT_HISTORY_NAMESPACE (token) or FASTAGENT_SESSION_NAMESPACE (protected).
 Project-local secret files must be root .env or .env.* (not .env.example).
 No runtime variables or Railway tokens are inherited. Native gcloud config is used.
 Railway login prints token instructions, not an authentication claim.
@@ -47,16 +60,18 @@ no API enablement, billing setup or broad IAM grants. Logs may withhold payloads
 Destroy requires --yes and verified ownership; retained shared/build resources may remain billable.
 check reads the current project's saved target and requests bounded HTTPS /healthz only.
 If both providers are recorded, select --provider. Health does not certify model keys/tools.
---chat is deferred (exit 2); manually test protected chat in the browser instead.
+check --chat is not implemented (exit 2). Use fastagent chat for an explicit billable request.
 dashboard requires a TTY; --json returns LOCAL cached records without network requests.
 TTY keys: arrows select, R refresh health + explicit selected provider status when selectors/auth
 are supplied, Enter open URL, L logs with selectors/auth, Q quit. Polling never calls models
 or cloud status APIs. Recorded deployment status and HTTP health remain separate.
 dev runs on explicit localhost HTTP; --install opts in to npm installation.
 JSON dev is unsupported; readiness is announced by the running server.
+There is no native iMessage integration. A separate Mac-side bridge can call this API; cloud hosts cannot access Apple Messages.
+Published npm 0.1.0 is the previous password-protected app. This source is unreleased headless behavior.
 JSON results are written to stdout, including errors; text errors use stderr.
 Exit codes: 0 success, 1 operation/configuration failure, 2 invalid arguments;
-130 SIGINT and 143 SIGTERM for deployment/check/dashboard (deployment checkpoints retained).
+130 SIGINT and 143 SIGTERM for deployment/check/dashboard/chat (deployment checkpoints retained).
 Dashboard also handles SIGHUP (129) and SIGQUIT (131), restoring terminal state.
 `;
 
@@ -92,6 +107,12 @@ async function run(): Promise<void> {
           yes: { type: 'boolean' },
           interactive: { type: 'boolean' },
           chat: { type: 'boolean' },
+          url: { type: 'string' },
+          message: { type: 'string' },
+          conversation: { type: 'string' },
+          search: { type: 'string' },
+          limit: { type: 'string' },
+          tools: { type: 'boolean' },
         },
       });
     } catch {
@@ -108,8 +129,14 @@ async function run(): Promise<void> {
       process.stdout.write(json ? JSON.stringify({ ok: true, command: 'version', version: metadata.version }) + '\n' : `${metadata.version}\n`);
       return;
     }
+    if (positionals[0] !== 'models' && ['search', 'limit', 'tools'].some((key) => values[key as keyof typeof values] !== undefined)) {
+      throw new FastagentError('INVALID_ARGUMENTS', 'Model catalog flags are supported only by models.', 2);
+    }
+    if (positionals[0] !== 'chat' && ['url', 'message', 'conversation'].some((key) => values[key as keyof typeof values] !== undefined)) {
+      throw new FastagentError('INVALID_ARGUMENTS', 'Chat flags are supported only by chat.', 2);
+    }
     if (values.chat !== undefined) {
-      if (positionals[0] === 'check') throw new FastagentError('CHAT_CHECK_UNSUPPORTED', 'check --chat is not implemented. check tests health only, not model keys or tools. Open the protected chat UI for an explicit manual model test (billable).', 2);
+      if (positionals[0] === 'check') throw new FastagentError('CHAT_CHECK_UNSUPPORTED', 'check --chat is not implemented. check tests health only, not model keys or tools. Use fastagent chat for an explicit manual model test (billable).', 2);
       throw new FastagentError('INVALID_ARGUMENTS', '--chat is recognized only by check and is not implemented.', 2);
     }
     const deploymentFlags = ['provider', 'target', 'workspace', 'project', 'region', 'runtime-account', 'build-account', 'railway-project', 'railway-environment', 'env-file', 'auth-file', 'dry-run', 'yes', 'interactive'];
@@ -192,6 +219,52 @@ async function run(): Promise<void> {
       }
       return;
     }
+    if (positionals[0] === 'models') {
+      if (positionals.length !== 1 || ['name', 'framework', 'install', 'provider', 'target', 'workspace', 'project', 'region', 'runtime-account', 'build-account', 'railway-project', 'railway-environment', 'env-file', 'auth-file', 'dry-run', 'yes', 'interactive'].some((key) => values[key as keyof typeof values] !== undefined)) {
+        throw new FastagentError('INVALID_ARGUMENTS', 'Usage: fastagent models [--search <text>] [--limit <n>] [--tools] [--json]', 2);
+      }
+      const limit = values.limit === undefined ? undefined : Number(values.limit);
+      if (values.limit !== undefined && (!/^\d+$/.test(values.limit) || limit !== Number(values.limit))) {
+        throw new FastagentError('INVALID_ARGUMENTS', 'models --limit must be an integer from 1 to 1000.', 2);
+      }
+      let catalog: OpenRouterCatalog;
+      try {
+        catalog = await fetchOpenRouterCatalog({
+          ...(values.search === undefined ? {} : { search: values.search }),
+          ...(limit === undefined ? {} : { limit }),
+          ...(values.tools ? { toolsOnly: true } : {}),
+        });
+      } catch (error) {
+        if (error instanceof OpenRouterCatalogError) throw new FastagentError('CATALOG_UNAVAILABLE', error.message);
+        if (error instanceof Error && /Invalid model catalog filter/.test(error.message)) throw new FastagentError('INVALID_ARGUMENTS', 'Invalid models filter. Limit is 1–1000 and search is at most 200 characters.', 2);
+        throw error;
+      }
+      process.stdout.write(json ? JSON.stringify({ ok: true, command: 'models', ...catalog }) + '\n' : formatModels(catalog));
+      return;
+    }
+    if (positionals[0] === 'chat') {
+      if (positionals.length !== 1 || !values.url || !values['env-file']?.length || ['name', 'framework', 'install', 'provider', 'target', 'workspace', 'project', 'region', 'runtime-account', 'build-account', 'railway-project', 'railway-environment', 'auth-file', 'dry-run', 'yes', 'interactive', 'search', 'limit', 'tools'].some((key) => values[key as keyof typeof values] !== undefined)) {
+        throw new FastagentError('INVALID_ARGUMENTS', 'Usage: fastagent chat --url <origin> --env-file <file> [--message <text>] [--conversation <id>] [--json]', 2);
+      }
+      const controller = new AbortController();
+      let signalCode: number | undefined;
+      const interrupt = () => { signalCode = 130; controller.abort(); };
+      const terminate = () => { signalCode = 143; controller.abort(); };
+      process.once('SIGINT', interrupt); process.once('SIGTERM', terminate);
+      try {
+        const cwd = resolve(process.cwd());
+        const loaded = await loadExplicitSecrets(values['env-file'], cwd, ['FASTAGENT_API_TOKEN'], []);
+        const token = loaded.FASTAGENT_API_TOKEN;
+        if (!token) throw new FastagentError('CHAT_AUTH_INVALID', 'Explicit env file must assign FASTAGENT_API_TOKEN. It is not read from arguments or the shell.');
+        const message = values.message ?? await readChatStdin();
+        const result = await sendChat({ url: values.url, token, message, ...(values.conversation ? { conversationId: values.conversation } : {}), signal: controller.signal });
+        process.stdout.write(json ? JSON.stringify({ ok: true, command: 'chat', ...result }) + '\n' : `conversation: ${result.conversationId}\n${result.text}\n`);
+      } finally {
+        process.off('SIGINT', interrupt); process.off('SIGTERM', terminate);
+        if (signalCode) process.exitCode = signalCode;
+      }
+      return;
+    }
     if (deploymentFlags.some((key) => values[key as keyof typeof values] !== undefined)) throw new FastagentError('INVALID_ARGUMENTS', 'Deployment flags are supported only by deployment commands.', 2);
     if (positionals[0] === 'dev') {
       if (json) throw new FastagentError('JSON_UNSUPPORTED', 'dev does not support --json; run it in text mode.', 2);
@@ -218,7 +291,7 @@ async function run(): Promise<void> {
     });
     process.stdout.write(json
       ? JSON.stringify({ ok: true, command: 'init', ...result }) + '\n'
-      : `Created scaffold at ${result.directory}\nFramework: ${result.framework}\nRunnable protected chat template; configure access and model secrets as described in README.md.\n`);
+      : `Created scaffold at ${result.directory}\nFramework: ${result.framework}\nRunnable headless chat template; configure the bearer token and model key as described in README.md.\n`);
   } catch (error) {
     const safe = error instanceof FastagentError
       ? error
@@ -227,6 +300,29 @@ async function run(): Promise<void> {
     else process.stderr.write(`Error [${safe.code}]: ${safe.message}\n`);
     process.exitCode ??= safe.exitCode;
   }
+}
+
+function formatModels(catalog: OpenRouterCatalog): string {
+  const lines = catalog.models.map((model) => {
+    const tools = model.supportsTools === null ? 'tools unknown' : model.supportsTools ? 'tools' : 'no tools';
+    const input = model.inputUsdPerMillion === null ? 'input unknown' : `input ~$${model.inputUsdPerMillion}/M`;
+    const output = model.outputUsdPerMillion === null ? 'output unknown' : `output ~$${model.outputUsdPerMillion}/M`;
+    return `${model.reference}  ${tools}  ${input}  ${output}  ${model.sourceUrl}`;
+  });
+  return [`OpenRouter catalog ${catalog.sourceUrl}`, `Fetched ${catalog.fetchedAt}; prices are estimates, not spending caps.`, ...lines, ''].join('\n');
+}
+
+async function readChatStdin(): Promise<string> {
+  if (process.stdin.isTTY) throw new FastagentError('INVALID_ARGUMENTS', 'Pass --message or pipe message text. The bearer token is never read from arguments or the shell.', 2);
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of process.stdin) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buffer.length;
+    if (size > 16_000) throw new FastagentError('CHAT_INPUT_INVALID', 'Chat message must be 1–4000 non-blank characters.', 2);
+    chunks.push(buffer);
+  }
+  return validateChatMessage(Buffer.concat(chunks).toString('utf8'));
 }
 
 await run();

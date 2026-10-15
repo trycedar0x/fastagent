@@ -1,7 +1,8 @@
 import { readFile, realpath } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { parseConfig, projectNameSchema } from '../config/config.js';
+import { parseConfig, projectNameSchema, type ProjectConfig } from '../config/config.js';
 import { FastagentError } from '../errors.js';
+import { modelApiKeyName } from '../models/reference.js';
 import { createDeploymentHttp } from './http.js';
 import { interactiveCloudLogin } from './login.js';
 import { createProcessRunner, redactProcessOutput, type ProcessRunner } from './process.js';
@@ -43,7 +44,11 @@ export interface DeploymentDependencies {
   login?: typeof interactiveCloudLogin;
 }
 const invalid = () => new FastagentError('INVALID_ARGUMENTS', 'Invalid deployment options. Run fastagent --help for command-specific flags.', 2);
-const runtimeKeys = ['FASTAGENT_PASSWORD_HASH', 'OPENAI_API_KEY', 'REDIS_URL', 'APP_ORIGIN', 'FASTAGENT_SESSION_NAMESPACE'];
+const namespaceKeys = ['APP_ORIGIN', 'FASTAGENT_SESSION_NAMESPACE', 'FASTAGENT_HISTORY_NAMESPACE'];
+function runtimeKeysFor(config: ProjectConfig): string[] {
+  if (config.deployment.access === 'protected') return ['FASTAGENT_PASSWORD_HASH', 'OPENAI_API_KEY', 'REDIS_URL', 'APP_ORIGIN', 'FASTAGENT_SESSION_NAMESPACE'];
+  return ['FASTAGENT_API_TOKEN', modelApiKeyName(config.model), 'REDIS_URL', 'APP_ORIGIN', 'FASTAGENT_HISTORY_NAMESPACE'];
+}
 
 /** Select only native CLI configuration, never model credentials or arbitrary ambient variables. */
 export function deploymentCommandEnvironment(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
@@ -105,17 +110,19 @@ export async function executeDeployment(options: DeploymentOptions, dependencies
     let result: Record<string, unknown>;
     if (command === 'deploy') {
       if (record?.status === 'destroying') throw new FastagentError('DEPLOYMENT_DESTROY_PENDING', 'Target destruction is pending; finish or inspect destruction before deploying.');
-      const environment = await loadExplicitSecrets(options.envFiles ?? [], cwd, runtimeKeys, sensitive);
+      const environment = await loadExplicitSecrets(options.envFiles ?? [], cwd, runtimeKeysFor(config), sensitive);
       if (!record && auth.RAILWAY_TOKEN && !options.dryRun) throw new FastagentError('RAILWAY_ACCOUNT_REQUIRED', 'First deployment requires an account/workspace API token; project tokens require an existing recorded target.');
       const initial = record ?? { ...createDeploymentRecord(lock.selector), selectors,
         resources: name === 'cloudrun' ? [{ kind: 'project' as const, id: options.project!, ownership: 'external' as const }] : [] };
-      if (environment.FASTAGENT_SESSION_NAMESPACE && environment.FASTAGENT_SESSION_NAMESPACE !== initial.sessionNamespace && record) throw new FastagentError('DEPLOYMENT_NAMESPACE_MISMATCH', 'Session namespace must match the recorded target.');
-      if (!record && environment.FASTAGENT_SESSION_NAMESPACE) initial.sessionNamespace = environment.FASTAGENT_SESSION_NAMESPACE;
-      const validated = validatePreflightEnvironment({ ...environment, FASTAGENT_SESSION_NAMESPACE: initial.sessionNamespace });
+      const namespaceKey = config.deployment.access === 'token' ? 'FASTAGENT_HISTORY_NAMESPACE' : 'FASTAGENT_SESSION_NAMESPACE';
+      const suppliedNamespace = environment[namespaceKey];
+      if (suppliedNamespace && suppliedNamespace !== initial.sessionNamespace && record) throw new FastagentError('DEPLOYMENT_NAMESPACE_MISMATCH', 'Redis namespace must match the recorded target.');
+      if (!record && suppliedNamespace) initial.sessionNamespace = suppliedNamespace;
+      const validated = validatePreflightEnvironment({ ...environment, [namespaceKey]: initial.sessionNamespace });
       source = await stageDeploymentSource({ projectPath: cwd });
       if (options.signal?.aborted) throw new FastagentError('DEPLOYMENT_CANCELLED', 'Operation cancelled before deployment.');
       if (options.dryRun) result = { command, provider: name, target, dryRun: true, selectors, files: source.files, bytes: source.bytes,
-        secretKeys: Object.keys(validated).filter((key) => !['APP_ORIGIN', 'FASTAGENT_SESSION_NAMESPACE'].includes(key)),
+        secretKeys: Object.keys(validated).filter((key) => !namespaceKeys.includes(key)),
         plan: ['Validate explicit runtime secrets and filtered source (complete)', 'On deploy: verify native CLI, authorization, billing and prerequisites', 'Create/update recorded resources, inject secrets, upload source, verify HTTPS health'],
         notice: 'No provider operations performed. Deployment is billable; TLS Redis is user-owned. This plan does not certify cloud permissions or readiness.' };
       else {

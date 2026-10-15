@@ -7,9 +7,9 @@
 <text font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#183153" text-anchor="start"><tspan x="50" y="103">Deployment reads explicit files. Local dev instead loads .env and .env.auth automatically.</tspan></text>
 <text font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#183153" text-anchor="start"><tspan x="50" y="146">IGNORED FILES ON YOUR MACHINE</tspan></text>
 <rect x="50" y="170" width="300" height="105" rx="12" fill="#fff9db" stroke="#183153" stroke-width="2"/>
-<text font-family="Arial, Helvetica, sans-serif" font-size="19" fill="#183153" text-anchor="middle"><tspan x="200" y="217.75">.env</tspan><tspan x="200" y="241.5">OPENAI_API_KEY + REDIS_URL</tspan></text>
+<text font-family="Arial, Helvetica, sans-serif" font-size="19" fill="#183153" text-anchor="middle"><tspan x="200" y="217.75">.env</tspan><tspan x="200" y="241.5">Model key + REDIS_URL</tspan></text>
 <rect x="50" y="320" width="300" height="105" rx="12" fill="#fff9db" stroke="#183153" stroke-width="2"/>
-<text font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#183153" text-anchor="middle"><tspan x="200" y="368">.env.auth</tspan><tspan x="200" y="390.5">FASTAGENT_PASSWORD_HASH</tspan></text>
+<text font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#183153" text-anchor="middle"><tspan x="200" y="368">.env.auth</tspan><tspan x="200" y="390.5">FASTAGENT_API_TOKEN</tspan></text>
 <rect x="50" y="470" width="300" height="105" rx="12" fill="#f3f0ff" stroke="#183153" stroke-width="2"/>
 <text font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#183153" text-anchor="middle"><tspan x="200" y="506.75">Railway only: .env.railway</tspan><tspan x="200" y="529.25">RAILWAY_API_TOKEN</tspan><tspan x="200" y="551.75">or scoped RAILWAY_TOKEN</tspan></text>
 <rect x="50" y="620" width="300" height="105" rx="12" fill="#f3f0ff" stroke="#183153" stroke-width="2"/>
@@ -17,7 +17,7 @@
 <rect x="495" y="255" width="260" height="290" rx="12" fill="#e7f5ff" stroke="#183153" stroke-width="2"/>
 <text font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#183153" text-anchor="middle"><tspan x="625" y="361.75">Fastagent deploy</tspan><tspan x="625" y="384.25">--env-file: runtime files</tspan><tspan x="625" y="406.75">--auth-file: Railway token</tspan><tspan x="625" y="429.25">gcloud auth: Cloud Run</tspan><tspan x="625" y="451.75">Explicit provider settings</tspan></text>
 <rect x="885" y="235" width="270" height="330" rx="12" fill="#ebfbee" stroke="#183153" stroke-width="2"/>
-<text font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#183153" text-anchor="middle"><tspan x="1020" y="339.25">Your protected app</tspan><tspan x="1020" y="361.75">Runtime configuration:</tspan><tspan x="1020" y="384.25">OpenAI key</tspan><tspan x="1020" y="406.75">Password hash</tspan><tspan x="1020" y="429.25">TLS Redis URL</tspan><tspan x="1020" y="451.75">APP_ORIGIN from the CLI</tspan><tspan x="1020" y="474.25">PORT from the platform</tspan></text>
+<text font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#183153" text-anchor="middle"><tspan x="1020" y="339.25">Your chat app</tspan><tspan x="1020" y="361.75">Runtime configuration:</tspan><tspan x="1020" y="384.25">Model key</tspan><tspan x="1020" y="406.75">Bearer token</tspan><tspan x="1020" y="429.25">TLS Redis URL</tspan><tspan x="1020" y="451.75">APP_ORIGIN from the CLI</tspan><tspan x="1020" y="474.25">PORT from the platform</tspan></text>
 <path d="M 362 222 L 430 222 L 430 315 L 483 315" fill="none" stroke="#183153" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
 <path d="M 362 372 L 483 372" fill="none" stroke="#183153" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
 <path d="M 362 522 L 430 522 L 430 450 L 483 450" fill="none" stroke="#183153" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)" stroke-dasharray="7 6"/>

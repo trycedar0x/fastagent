@@ -1,41 +1,47 @@
 ---
 name: fastagent-app
-description: Edit a Fastagent-generated protected chat app, or the openai template, without breaking auth, health, streaming, or secret boundaries. Use when changing prompts, models, tools, or UI in a project created by `fastagent init`, or in `templates/openai`.
+description: Edit a Fastagent-generated headless chat app, or the openai template, without breaking bearer auth, health, streaming, history, or secret boundaries. Use when changing prompts, models, or tools in a project created by `fastagent init`, or in `templates/openai`.
 ---
 
 # Edit a Fastagent app
 
-Use this skill when changing prompts, models, tools, or UI in a generated app or `templates/openai/`. Use the `fastagent` skill for deployment.
+Use this skill when changing prompts, models, or tools in a generated app or `templates/openai/`. Use the `fastagent` skill for deployment.
 
-Read the app's README and AGENTS.md first. The adapter is the official OpenAI SDK, not Vercel AI SDK.
+Read the app's README and AGENTS.md first. The adapter is the official OpenAI SDK, aimed at OpenRouter or direct OpenAI, not Vercel AI SDK.
 
 ## Edit the right files
 
 - Prompt and model adapter: `src/agent.ts`.
-- Model ID: `fastagent.yaml`, using `openai/<model>`.
+- Model reference: `fastagent.yaml`, using `openrouter/<vendor>/<model>` or `openai/<model>`. The product default is `openrouter/deepseek/deepseek-v4.1-flash`.
 - Predefined tools: `src/tools.ts`.
-- Browser UI: `public/`.
 
-Keep agent logic out of transport/auth modules. Tools must be bounded server logic, not shell or arbitrary execution. Do not fabricate external data. Render output with `textContent`, never untrusted HTML.
+Keep agent logic out of transport/auth modules. Tools must be bounded server logic, not shell or arbitrary execution. Do not fabricate external data.
+
+There is no browser UI in a newly generated app. Do not add a password page or a per-visitor login. A separate client, including a Mac-side bridge, can call the HTTP API.
 
 In the CLI repository, adding a template asset also requires adding it to the manifest in `src/scaffold/render.ts`.
 
 ## Preserve the runtime contract
 
 - Health never calls a model. It returns 200 when ready and may return 503 during Redis outages.
-- Chat uses the documented NDJSON protocol and bounded input/output/tool steps.
+- One bearer token authorizes every conversation; requests must present exactly one `Authorization: Bearer` field. Query tokens, cookies, and duplicate fields are rejected. If `Origin` is present it must match `APP_ORIGIN` exactly.
+- Chat uses the documented NDJSON protocol and bounded input/output/concurrency/duration/tool steps.
+- Commit history only after a completed turn. Failed or aborted work must release its lease and must not extend retention. Commit, release, and delete check lease ownership atomically.
+- Keep the anti-abuse and history bounds: 7-day sliding expiry, 1000 conversations per app, 40 messages and 256 KiB per conversation, a 45-second generation lease, and a separate model context of 20 messages and 16,000 characters.
 - Disconnects and shutdown abort work where supported.
-- Password protection, salted scrypt hashes, hashed expiring sessions, secure cookies, exact Origin, CSRF, and generic errors stay in place.
+- Do not disclose reasoning content. Empty, whitespace-only, and reasoning-only completions are generic failures.
+- Keep the scoped SSE guard that rejects `thread.*` events before the SDK logs them.
 - Plain HTTP is explicit localhost development only.
-- Production requires user-supplied TLS Redis. Never fall back to memory on outage or log its URL.
-- Keep the app namespace stable across versions. Password changes alone do not revoke shared sessions.
+- Production requires user-supplied TLS Redis for conversation history. Never fall back to memory on outage or log its URL.
+- Keep the app's history namespace stable across versions and distinct from other apps.
+- Do not add native iMessage integration. A separate Mac-side bridge may call this API; cloud hosts cannot access Apple Messages.
 
-Do not commit or upload env files, passwords, hashes, API keys, Redis URLs, cloud credentials, or conversation logs. Keep `.env.example` placeholder-only and builds credential-free. Preserve explicit Docker copies and ignore rules.
+Do not commit or upload env files, bearer tokens, API keys, Redis URLs, cloud credentials, or conversation logs. Keep `.env.example` placeholder-only and builds credential-free. Preserve explicit Docker copies and ignore rules.
 
 ## Validate
 
 Run `npm run typecheck` and `npm run build` in the app.
 
-Test through `createRuntime` with an injected `ChatModel` implementing `stream(call)` as an async iterable. Inject a session store when needed. Do not use AI SDK mocks, real credentials, or paid models.
+Test through `createRuntime` with an injected `ChatModel` implementing `stream(call)` as an async iterable. Inject a history store when needed. Do not use real credentials or paid models.
 
 Health success does not prove chat or tools work. Do not deploy, delete resources, publish, or call paid models without explicit authorization.

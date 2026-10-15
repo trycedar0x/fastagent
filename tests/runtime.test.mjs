@@ -1,666 +1,411 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { createServer as createTcpServer } from 'node:net';
-import { randomBytes, scryptSync } from 'node:crypto';
-import { mkdtemp, realpath, rm, symlink, readFile, writeFile } from 'node:fs/promises';
+import { request } from 'node:http';
+import { randomBytes } from 'node:crypto';
+import { mkdtemp, cp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import test, { before, after } from 'node:test';
-import { initProject } from '../dist/scaffold/init.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
-const password = 'test-only-password-123';
-const salt = randomBytes(16);
-const passwordHash = `scrypt-v1$${salt.toString('hex')}$${scryptSync(password, salt, 64).toString('hex')}`;
-const textChunks = [
-  { type: 'text-delta', text: 'Hello <script>' },
-  { type: 'text-delta', text: '世界' },
-];
-function mockModel(produce = async function* () { for (const part of textChunks) yield part; }) {
-  const calls = [];
-  const generate = typeof produce === 'function' ? produce : async function* () { for (const part of produce) yield part; };
-  return { calls, async *stream(call) { calls.push(call); yield* generate(call); } };
-}
-let directory;
-let parent;
-let createRuntime;
-let createAuth;
-let createMemorySessionStore;
-let validateRedisConfig;
-let createRedisSessionStore;
-let validateRuntimeConfig;
-let createModel;
-let tools;
-
+const apiToken = randomBytes(32).toString('base64url');
+const id = () => randomBytes(32).toString('base64url');
+const defaultModel = 'openrouter/deepseek/deepseek-v4.1-flash';
+let directory, createRuntime, history, config, auth;
 before(async () => {
-  parent = await realpath(await mkdtemp(join(tmpdir(), 'fastagent-runtime-test-')));
-  directory = (await initProject({ directory: 'agent', cwd: parent })).directory;
-  // Repository tests reuse installed development SDK/compiler; standalone npm install is a separate gate.
+  directory = await mkdtemp(join(tmpdir(), 'fastagent-runtime-test-'));
+  // Runtime ownership deliberately excludes the scaffold manifest, reconciled by integration stage.
+  await cp(join(root, 'templates/openai/src'), join(directory, 'src'), { recursive: true });
+  await cp(join(root, 'templates/openai/tsconfig.json'), join(directory, 'tsconfig.json'));
+  await writeFile(join(directory, 'package.json'), JSON.stringify({ type: 'module', scripts: { typecheck: 'tsc --noEmit', build: 'tsc' } }));
   await symlink(join(root, 'node_modules'), join(directory, 'node_modules'), 'dir');
-  const built = spawnSync(process.execPath, [join(root, 'node_modules/typescript/bin/tsc')], { cwd: directory, encoding: 'utf8' });
-  assert.equal(built.status, 0, built.stdout + built.stderr);
+  for (const command of ['typecheck', 'build']) {
+    const result = spawnSync('npm', ['run', command], { cwd: directory, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+  }
   ({ createRuntime } = await import(pathToFileURL(join(directory, 'dist/server.js'))));
-  ({ createMemorySessionStore } = await import(pathToFileURL(join(directory, 'dist/session-store.js'))));
-  ({ validateRedisConfig, createRedisSessionStore } = await import(pathToFileURL(join(directory, 'dist/redis-session-store.js'))));
-  ({ createAuth } = await import(pathToFileURL(join(directory, 'dist/auth.js'))));
-  ({ validateRuntimeConfig } = await import(pathToFileURL(join(directory, 'dist/config.js'))));
-  ({ createModel } = await import(pathToFileURL(join(directory, 'dist/agent.js'))));
-  ({ tools } = await import(pathToFileURL(join(directory, 'dist/tools.js'))));
+  history = await import(pathToFileURL(join(directory, 'dist/history-store.js')));
+  config = await import(pathToFileURL(join(directory, 'dist/config.js')));
+  auth = await import(pathToFileURL(join(directory, 'dist/auth.js')));
 });
-after(async () => { if (parent) await rm(parent, { recursive: true, force: true }); });
-
-async function runtime(t, model = mockModel(), production = false, sessionStore) {
-  const config = { origin: production ? 'https://chat.example' : 'http://localhost:3000', localDev: !production, passwordHash, model, sessionStore: sessionStore ?? (production ? createMemorySessionStore() : undefined) };
-  const instance = await createRuntime(config);
+after(async () => { if (directory) await rm(directory, { recursive: true, force: true }); });
+function mockModel(produce = async function* () { yield { type: 'text-delta', text: 'Hello 世界' }; }) {
+  const calls = [];
+  return { calls, async *stream(call) { calls.push(call); yield* produce(call); } };
+}
+async function runtime(t, model = mockModel(), historyStore, overrides = {}) {
+  const instance = await createRuntime({ origin: 'http://localhost:3000', localDev: true, apiToken, model, ...(historyStore ? { historyStore } : {}), ...overrides });
   await new Promise(resolve => instance.server.listen(0, '127.0.0.1', resolve));
   t.after(async () => { instance.abortAll(); await instance.closeStore(); instance.server.closeAllConnections(); await new Promise(resolve => instance.server.close(resolve)); });
   const base = `http://127.0.0.1:${instance.server.address().port}`;
-  const client = {
-    ...instance, config, base, cookie: '', csrf: '',
-    async bootstrap() {
-      const response = await fetch(`${base}/api/session`, { headers: { Cookie: this.cookie } });
-      this.cookie = response.headers.get('set-cookie')?.split(';')[0] ?? this.cookie;
-      const session = await response.json(); this.csrf = session.csrf;
-      return { response, session };
-    },
-    async post(path, data, overrides = {}, signal) {
-      const response = await fetch(`${base}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: config.origin, Cookie: this.cookie, 'X-CSRF-Token': this.csrf, ...overrides }, body: JSON.stringify(data), signal });
-      return response;
-    },
-    async login() {
-      await this.bootstrap();
-      const response = await this.post('/api/login', { password });
-      assert.equal(response.status, 200);
-      this.cookie = response.headers.get('set-cookie').split(';')[0]; this.csrf = (await response.json()).csrf;
-    },
+  return { ...instance, base,
+    get: (path, headers = {}) => fetch(base + path, { headers: { Authorization: `Bearer ${apiToken}`, ...headers } }),
+    post: (data, headers = {}, signal) => fetch(base + '/api/chat', { method: 'POST', headers: { Authorization: `Bearer ${apiToken}`, 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(data), signal }),
+    delete: conversationId => fetch(base + '/api/conversations/' + conversationId, { method: 'DELETE', headers: { Authorization: `Bearer ${apiToken}` } }),
   };
-  return client;
 }
-const chat = { messages: [{ role: 'user', content: 'Hi' }] };
+const frames = async response => (await response.text()).trim().split('\n').map(line => JSON.parse(line));
+const turn = async (app, message = 'Hi', conversationId) => {
+  const response = await app.post({ message, ...(conversationId ? { conversationId } : {}) });
+  assert.equal(response.status, 200); return frames(response);
+};
+const shared = store => ({ ...store, async close() {} });
+const waitUntil = async predicate => {
+  for (let i = 0; i < 100; i++) { if (predicate()) return; await new Promise(resolve => setTimeout(resolve, 10)); }
+  assert.fail('Condition did not become true');
+};
 
-test('runtime/server: health and static UI never call model; UI has no HTML injection', async t => {
+test('runtime/server: headless health is public, serves no assets/login and never calls model', async t => {
   const model = mockModel(); const app = await runtime(t, model);
-  const health = await fetch(`${app.base}/healthz`);
-  assert.equal(health.status, 200); assert.deepEqual(await health.json(), { ok: true });
-  const page = await fetch(`${app.base}/`); assert.equal(page.status, 200);
-  assert.match(page.headers.get('content-security-policy'), /frame-ancestors 'none'/);
-  assert.match(await page.text(), /app.js/);
-  const ui = await (await fetch(`${app.base}/app.js`)).text();
-  assert.match(ui, /textContent/); assert.doesNotMatch(ui, /innerHTML|document.write/);
-  assert.match(ui, /TextDecoder/); assert.match(ui, /frame.type === 'done'/);
-  assert.equal((await fetch(`${app.base}/.env`)).status, 404);
+  const response = await fetch(app.base + '/healthz');
+  assert.equal(response.status, 200); assert.deepEqual(await response.json(), { ok: true });
+  for (const path of ['/', '/app.js', '/style.css', '/api/session', '/api/login', '/api/logout', '/.env']) assert.equal((await app.get(path)).status, 404);
   assert.equal(model.calls.length, 0);
 });
 
-test('runtime/auth: production cookies, pre-login CSRF, rotation, hashed session, revocation', async t => {
-  const app = await runtime(t, mockModel(), true);
-  const { response, session } = await app.bootstrap();
-  const cookieHeader = response.headers.get('set-cookie');
-  assert.equal(session.authenticated, false);
-  assert.match(cookieHeader, /^__Host-fastagent=/);
-  for (const flag of ['HttpOnly', 'Secure', 'SameSite=Strict', 'Path=/', 'Max-Age=300']) assert.ok(cookieHeader.includes(flag));
-  assert.doesNotMatch(cookieHeader, /Domain=/i);
-  assert.equal((await app.post('/api/chat', chat)).status, 401);
-  for (const headers of [{ Origin: 'https://evil.example' }, { Origin: '' }, { 'X-CSRF-Token': '' }, { Cookie: '' }]) {
-    const denied = await app.post('/api/login', { password }, headers);
-    assert.ok([401, 403].includes(denied.status));
-    assert.deepEqual(await denied.json(), { error: 'Authentication failed.' });
+test('runtime/auth: constant-time bounded bearer verification; duplicate fields, cookies and query tokens rejected', async t => {
+  for (const token of ['', 'x'.repeat(42), 'x'.repeat(257), 'a'.repeat(43) + '\n', 'test-only secret']) {
+    assert.throws(() => auth.validateApiToken(token), { message: 'Invalid bearer token configuration.' });
   }
-  const oldCookie = app.cookie; const oldCsrf = app.csrf;
-  const login = await app.post('/api/login', { password }); assert.equal(login.status, 200);
-  app.cookie = login.headers.get('set-cookie').split(';')[0]; app.csrf = (await login.json()).csrf;
-  assert.match(login.headers.get('set-cookie'), /Max-Age=3600/);
-  assert.notEqual(app.cookie, oldCookie); assert.notEqual(app.csrf, oldCsrf);
-  assert.equal((await app.post('/api/chat', chat, { Cookie: oldCookie, 'X-CSRF-Token': oldCsrf })).status, 401);
-  assert.equal((await app.post('/api/chat', chat, { 'X-CSRF-Token': oldCsrf })).status, 401);
-  assert.equal((await app.post('/api/logout', {})).status, 200);
-  assert.equal((await app.post('/api/chat', chat)).status, 401);
-  const source = await readFile(join(directory, 'src/auth.ts'), 'utf8');
-  assert.match(source, /store.issue\(digest\(raw\)/); assert.doesNotMatch(source, /store.issue\(raw/);
-});
-
-// Exercise production capacities without HTTP connection overhead; all password checks use real scrypt.
-async function authClient(auth, peer) {
-  let cookie = '';
-  const req = { headers: {}, socket: { remoteAddress: peer } };
-  const res = { setHeader(name, value) { if (name === 'Set-Cookie') cookie = value.split(';')[0]; } };
-  const session = await auth.session(req, res);
-  if (session) { req.headers.cookie = cookie; req.headers['x-csrf-token'] = session.csrf; }
-  return { req, res, session, update(session) {
-    this.session = session; req.headers.cookie = cookie; req.headers['x-csrf-token'] = session.csrf;
-  } };
-}
-
-test('runtime/auth: anonymous issuance throttles socket peers, ignores forwarded headers and recovers', async t => {
-  const app = await runtime(t); await app.login();
-  const now = Date.now(); let time = now;
-  t.mock.method(Date, 'now', () => time);
-  try {
-    // Login already issued one anonymous cookie in this peer's window.
-    let retained;
-    for (let i = 0; i < 19; i++) {
-      const response = await fetch(`${app.base}/api/session`, { headers: { 'X-Forwarded-For': `192.0.2.${i}` } });
-      assert.equal(response.status, 200);
-      retained = { Cookie: response.headers.get('set-cookie').split(';')[0], csrf: (await response.json()).csrf };
-    }
-    const limited = await fetch(`${app.base}/api/session`, { headers: { 'X-Forwarded-For': '198.51.100.1' } });
-    assert.equal(limited.status, 503); assert.equal(limited.headers.get('set-cookie'), null);
-    assert.deepEqual(await limited.json(), { error: 'Authentication failed.' });
-    const existing = await fetch(`${app.base}/api/session`, { headers: { Cookie: retained.Cookie } });
-    assert.equal(existing.status, 200); assert.equal(existing.headers.get('set-cookie'), null);
-    assert.equal((await existing.json()).csrf, retained.csrf);
-    const authenticated = await fetch(`${app.base}/api/session`, { headers: { Cookie: app.cookie } });
-    assert.equal((await authenticated.json()).authenticated, true);
-    const login = await app.post('/api/login', { password }, { Cookie: retained.Cookie, 'X-CSRF-Token': retained.csrf });
-    assert.equal(login.status, 200); // Throttled issuance does not prevent valid login.
-    const rotation = await app.post('/api/login', { password });
-    assert.equal(rotation.status, 200); // Nor rotation of authenticated sessions.
-    time = now + 60001;
-    const recovered = await fetch(`${app.base}/api/session`);
-    assert.equal(recovered.status, 200); await recovered.json();
-  } finally { t.mock.restoreAll(); }
-});
-
-test('runtime/auth: anonymous capacity evicts oldest only, preserves authenticated sessions and permits login', async t => {
-  const auth = createAuth(passwordHash, false, createMemorySessionStore());
-  t.mock.method(Date, 'now', () => 1000000);
-  const protectedClient = await authClient(auth, 'protected');
-  protectedClient.update(await auth.login(protectedClient.req, protectedClient.res, password));
-  const oldest = await authClient(auth, 'first-anonymous');
-  let latest;
-  // Including oldest, 257 anonymous cookies exceeds the independent 256-entry capacity.
-  for (let i = 0; i < 256; i++) latest = await authClient(auth, `flood-${Math.floor(i / 20)}`);
-  assert.equal(await auth.authorize(protectedClient.req), true);
-  assert.notEqual((await auth.session(oldest.req, oldest.res))?.csrf, oldest.session.csrf);
-  assert.equal(await auth.session(latest.req, latest.res), latest.session);
-  latest.update(await auth.login(latest.req, latest.res, password));
-  assert.equal(await auth.authorize(latest.req), true);
-  assert.equal(await auth.authorize(protectedClient.req), true);
-});
-
-test('runtime/auth: anonymous expiry and issuance bucket saturation recover independently', async t => {
-  const auth = createAuth(passwordHash, false, createMemorySessionStore());
-  let now = 1000000;
-  t.mock.method(Date, 'now', () => now);
-  const clients = [];
-  for (let i = 0; i < 256; i++) {
-    const client = await authClient(auth, `peer-${i}`); assert.ok(client.session); clients.push(client);
+  const verify = auth.createAuth(apiToken);
+  const headers = { authorization: `Bearer ${apiToken}` };
+  assert.equal(verify.authorize({ headers, rawHeaders: ['Authorization', headers.authorization] }), true);
+  assert.equal(verify.authorize({ headers, rawHeaders: ['Authorization', headers.authorization, 'authorization', headers.authorization] }), false);
+  const store = history.createMemoryHistoryStore(); let operations = 0;
+  const spy = { ...store, async get(...args) { operations++; return store.get(...args); }, async acquire(...args) { operations++; return store.acquire(...args); }, async delete(...args) { operations++; return store.delete(...args); } };
+  const model = mockModel(); const app = await runtime(t, model, spy);
+  for (const Authorization of ['', `Bearer ${id()}`, `Bearer ${apiToken} extra`, 'Basic synthetic', `Bearer ${'x'.repeat(257)}`]) {
+    // Wrong content type and invalid body would fail differently if parsed before auth.
+    const response = await app.post({ messages: [], model: 'secret' }, { Authorization, 'Content-Type': 'text/plain' });
+    assert.equal(response.status, 401); assert.deepEqual(await response.json(), { error: 'Authentication failed.' });
   }
-  assert.equal((await authClient(auth, 'new-peer')).session, undefined);
-  assert.equal(await auth.session(clients.at(-1).req, clients.at(-1).res), clients.at(-1).session);
-  now += 60000;
-  const fresh = await authClient(auth, 'new-peer'); assert.ok(fresh.session);
-  assert.equal(await auth.session(fresh.req, fresh.res), fresh.session);
-  now += 300000;
-  assert.notEqual((await auth.session(fresh.req, fresh.res))?.csrf, fresh.session.csrf);
-});
-
-test('runtime/auth: full authenticated capacity allows own rotation and recovers after logout or expiry', async t => {
-  const auth = createAuth(passwordHash, false, createMemorySessionStore());
-  let now = 1000000;
-  t.mock.method(Date, 'now', () => now);
-  const clients = [];
-  for (let i = 0; i < 1000; i++) {
-    const client = await authClient(auth, `peer-${Math.floor(i / 20)}`);
-    const session = await auth.login(client.req, client.res, password);
-    assert.ok(session, `authenticated slot ${i}`); client.update(session); clients.push(client);
+  for (const method of ['GET', 'DELETE']) {
+    const response = await fetch(app.base + '/api/conversations/' + id(), { method });
+    assert.equal(response.status, 401);
   }
-  const first = clients[0];
-  const oldRequest = { ...first.req, headers: { ...first.req.headers } };
-  const rotated = await auth.login(first.req, first.res, password);
-  assert.ok(rotated); first.update(rotated);
-  assert.equal(await auth.authorize(first.req), true); assert.equal(await auth.authorize(oldRequest), false);
-  const waiting = await authClient(auth, 'waiting-peer');
-  assert.equal(await auth.login(waiting.req, waiting.res, password), undefined);
-  assert.equal(await auth.session(waiting.req, waiting.res), waiting.session); // Failed allocation retains pre-login session.
-  await auth.logout(first.req, first.res);
-  waiting.update(await auth.login(waiting.req, waiting.res, password));
-  assert.equal(await auth.authorize(waiting.req), true);
-  now += 3600000;
-  assert.equal(await auth.authorize(waiting.req), false);
-  const recovered = await authClient(auth, 'recovered-peer');
-  recovered.update(await auth.login(recovered.req, recovered.res, password));
-  assert.equal(await auth.authorize(recovered.req), true);
-});
-
-test('runtime/auth: simultaneous rotation consumes one slot and revokes the original', async () => {
-  const auth = createAuth(passwordHash, false, createMemorySessionStore());
-  const client = await authClient(auth, 'rotation-peer');
-  const original = { ...client.req, headers: { ...client.req.headers } };
-  const attempts = await Promise.all([auth.login(original, client.res, password), auth.login(original, client.res, password)]);
-  assert.equal(attempts.filter(Boolean).length, 1);
-  client.update(attempts.find(Boolean));
-  assert.equal(await auth.authorize(original), false); assert.equal(await auth.authorize(client.req), true);
-});
-
-test('runtime/auth: failed password is generic and immediate retry is backed off', async t => {
-  const app = await runtime(t); await app.bootstrap();
-  const failed = await app.post('/api/login', { password: 'wrong-test-password' });
-  assert.equal(failed.status, 401); assert.deepEqual(await failed.json(), { error: 'Authentication failed.' });
-  assert.equal((await app.post('/api/login', { password })).status, 401);
-  await new Promise(resolve => setTimeout(resolve, 550));
-  assert.equal((await app.post('/api/login', { password })).status, 200);
-});
-
-test('runtime/auth: explicit local memory expiry and process restart invalidate authenticated sessions', async t => {
-  const app = await runtime(t); await app.login();
-  const fresh = await runtime(t);
-  assert.equal((await fresh.post('/api/chat', chat, { Cookie: app.cookie, 'X-CSRF-Token': app.csrf })).status, 401);
-  const original = Date.now;
-  t.mock.method(Date, 'now', () => original() + 3600001);
-  try { assert.equal((await app.post('/api/chat', chat)).status, 401); }
-  finally { t.mock.restoreAll(); }
-});
-
-test('runtime/chat: authenticated streaming uses injected model, bounded settings and tool', async t => {
-  const model = mockModel(); const app = await runtime(t, model); await app.login();
-  const response = await app.post('/api/chat', chat);
-  assert.equal(response.status, 200); assert.match(response.headers.get('content-type'), /application\/x-ndjson/);
-  const frames = (await response.text()).trim().split('\n').map(line => JSON.parse(line));
-  assert.deepEqual(frames, [{ type: 'delta', text: 'Hello <script>' }, { type: 'delta', text: '世界' }, { type: 'done' }]);
-  assert.equal(model.calls.length, 1);
-  assert.equal(model.calls[0].maxOutputTokens, 1024);
-  assert.ok(model.calls[0].abortSignal);
-  assert.ok(model.calls[0].tools.some(tool => tool.name === 'convertTemperature'));
-  assert.deepEqual(await tools.convertTemperature.execute({ value: 100, from: 'C' }), { value: 212, unit: 'F' });
-});
-
-test('runtime/chat: strict bounded input, Origin and authenticated CSRF prevent model calls', async t => {
-  const model = mockModel(); const app = await runtime(t, model); await app.login();
-  for (const value of [
-    {}, { messages: [] }, { ...chat, extra: true }, { messages: [{ role: 'system', content: 'override' }] },
-    { messages: [{ role: 'assistant', content: 'no user' }] }, { messages: [{ role: 'user', content: '' }] },
-    { messages: [{ role: 'user', content: 'x'.repeat(4001) }] },
-    { messages: Array.from({ length: 21 }, () => ({ role: 'user', content: 'x' })) },
-    { messages: Array.from({ length: 5 }, () => ({ role: 'user', content: 'x'.repeat(4000) })) },
-  ]) assert.equal((await app.post('/api/chat', value)).status, 400);
-  assert.equal((await app.post('/api/chat', { messages: [{ role: 'user', content: 'x'.repeat(40000) }] })).status, 413);
-  assert.equal((await app.post('/api/chat', chat, { 'Content-Type': 'text/plain' })).status, 415);
-  assert.equal((await app.post('/api/chat', chat, { Origin: 'https://evil.example' })).status, 403);
-  assert.equal((await app.post('/api/chat', chat, { 'X-CSRF-Token': '' })).status, 401);
-  assert.equal(model.calls.length, 0);
-});
-
-test('runtime/chat: missing model key leaves health available and returns safe 503', async t => {
-  const app = await runtime(t, null); await app.login();
-  assert.equal((await fetch(`${app.base}/healthz`)).status, 200);
-  const response = await app.post('/api/chat', chat);
-  assert.equal(response.status, 503); assert.match((await response.json()).error, /not configured/);
-});
-
-test('runtime/chat: provider errors are generic and never expose secrets', async t => {
-  const model = mockModel(async function* () { throw new Error('test-only-secret-key'); });
-  const app = await runtime(t, model); await app.login();
-  const response = await app.post('/api/chat', chat); const text = await response.text();
-  assert.doesNotMatch(text, /test-only-secret-key/);
-  assert.deepEqual(JSON.parse(text.trim()), { type: 'error', error: 'Chat failed. Please try again.' });
-  assert.equal(model.calls.length, 1); // no retries
-});
-
-test('runtime/config: fail closed, unsupported model safe, missing key does not matter to build', async () => {
-  const valid = { origin: 'https://chat.example', localDev: false, passwordHash, model: undefined, sessionStore: createMemorySessionStore() };
-  validateRuntimeConfig(valid);
-  for (const changed of [
-    { passwordHash: '' }, { passwordHash: password }, { origin: '' }, { origin: 'http://chat.example' },
-    { origin: 'https://user:password@chat.example' }, { origin: 'https://chat.example/' },
-    { origin: 'http://chat.example', localDev: true },
-  ]) assert.throws(() => validateRuntimeConfig({ ...valid, ...changed }));
-  assert.equal(createModel('openai/gpt-4o-mini', undefined), undefined);
-  assert.throws(() => createModel('other/test-only-secret', undefined), error => /Unsupported model provider/.test(error.message) && !error.message.includes('test-only-secret'));
-  const startup = spawnSync(process.execPath, ['dist/main.js'], { cwd: directory, encoding: 'utf8', timeout: 5000, env: { PORT: '3000', APP_ORIGIN: 'https://chat.example' } });
-  assert.equal(startup.status, 1); assert.equal(startup.stdout, ''); assert.match(startup.stderr, /Invalid access protection configuration/);
-});
-
-test('runtime/config: IPv6 localhost fails safely before listening; IPv4 local origins remain valid', async t => {
-  const valid = { localDev: true, passwordHash, model: undefined };
-  for (const origin of ['http://localhost:3000', 'http://127.0.0.1:3000']) validateRuntimeConfig({ ...valid, origin });
-  const errorMessage = 'IPv6 localhost APP_ORIGIN is not supported. Use http://localhost or http://127.0.0.1 with the configured port.';
-  assert.throws(() => validateRuntimeConfig({ ...valid, origin: 'http://[::1]:3000' }), { message: errorMessage });
-  await assert.rejects(createRuntime({ ...valid, origin: 'http://[::1]:3000' }), { message: errorMessage });
-  const startup = spawnSync(process.execPath, ['dist/main.js'], { cwd: directory, encoding: 'utf8', timeout: 5000,
-    env: { PORT: '3000', FASTAGENT_LOCAL_DEV: '1', APP_ORIGIN: 'http://[::1]:3000', FASTAGENT_PASSWORD_HASH: passwordHash } });
-  assert.equal(startup.status, 1); assert.equal(startup.stdout, ''); assert.equal(startup.stderr, errorMessage + '\n');
-});
-
-test('runtime/chat: disconnect cancels model work and concurrency is capped', async t => {
-  const signals = [];
-  const model = mockModel(async function* ({ abortSignal }) {
-    signals.push(abortSignal);
-    yield { type: 'text-delta', text: 'first' };
-    await new Promise(resolve => abortSignal.addEventListener('abort', resolve, { once: true }));
+  const query = await fetch(app.base + '/api/chat?token=' + apiToken, { method: 'POST', headers: { Cookie: 'fastagent=' + apiToken }, body: '{}' });
+  assert.equal(query.status, 401);
+  assert.equal((await app.get('/api/conversations/' + id() + '?token=not-auth')).status, 400);
+  // Passing an array to http.request replaces Node's default headers, so Host must be set explicitly.
+  // Without it the request is malformed and the server answers an empty-bodied 400 before the handler runs,
+  // which would assert a client artifact instead of the app's behavior. With a well-formed request,
+  // duplicated Authorization fields must fail as an authentication error before any body, history,
+  // or model work, matching the in-process authorize() check above.
+  const duplicateStatus = await new Promise((resolve, reject) => {
+    const headers = ['Host', new URL(app.base).host, 'Authorization', `Bearer ${apiToken}`, 'Authorization', `Bearer ${apiToken}`, 'Content-Type', 'application/json'];
+    const req = request(app.base + '/api/chat', { method: 'POST', headers }, res => { res.resume(); resolve(res.statusCode); });
+    req.on('error', reject); req.end('{}');
   });
-  const app = await runtime(t, model); await app.login();
-  const pending = [];
-  for (let i = 0; i < 4; i++) {
-    const controller = new AbortController();
-    const response = await app.post('/api/chat', chat, {}, controller.signal);
-    const reader = response.body.getReader(); await reader.read();
-    pending.push({ controller, reader });
+  assert.equal(duplicateStatus, 401);
+  assert.equal(operations, 0); assert.equal(model.calls.length, 0);
+});
+
+test('runtime/server: no-Origin machine clients work, supplied browser origin must match exactly', async t => {
+  const model = mockModel(); const app = await runtime(t, model);
+  for (const Origin of ['', 'http://localhost:3000/', 'https://evil.example']) {
+    assert.equal((await app.post({ message: 'Hi' }, { Origin })).status, 403);
+    assert.equal((await app.get('/api/conversations/' + id(), { Origin })).status, 403);
   }
-  assert.equal((await app.post('/api/chat', chat)).status, 429);
-  for (const { controller } of pending) controller.abort();
-  await new Promise(resolve => setTimeout(resolve, 50));
-  assert.equal(signals.length, 4); assert.ok(signals.every(signal => signal.aborted));
+  const response = await app.post({ message: 'Hi' }, { Origin: 'http://localhost:3000' });
+  assert.equal(response.headers.get('set-cookie'), null);
+  assert.equal(response.headers.get('access-control-allow-origin'), null);
+  assert.equal((await frames(response)).at(-1).type, 'done');
+  assert.equal((await turn(app)).at(-1).type, 'done'); assert.equal(model.calls.length, 2);
 });
 
-test('runtime/chat: pure tool loop stops after three model steps', async t => {
-  const model = mockModel(async function* () {
-    yield { type: 'tool-call', toolCallId: randomBytes(4).toString('hex'), toolName: 'convertTemperature', input: JSON.stringify({ value: 0, from: 'C' }) };
-  });
-  const app = await runtime(t, model); await app.login();
-  const response = await app.post('/api/chat', chat); assert.match(await response.text(), /"type":"done"/);
-  assert.equal(model.calls.length, 3);
-});
-
-test('runtime/Docker: build contains no env or credential copies and runtime is non-root', async () => {
-  const docker = await readFile(join(directory, 'Dockerfile'), 'utf8');
-  assert.doesNotMatch(docker, /COPY\s+\.\s|ARG.*KEY|ENV.*KEY|COPY.*\.env/);
-  assert.match(docker, /USER node/); assert.match(docker, /CMD \["node", "dist\/main.js"\]/);
-  const ignore = await readFile(join(directory, '.dockerignore'), 'utf8');
-  assert.ok(ignore.split('\n').includes('**')); assert.match(ignore, /\*\*\/\.env\.\*/);
-  assert.match(ignore, /\*\*\/\.config\/\*\*/);
-});
-
-test('runtime/chat: duration aborts a stalled model and emits a terminal generic error', async t => {
-  let signal;
-  const model = mockModel(async function* ({ abortSignal }) {
-    signal = abortSignal;
-    await new Promise(resolve => abortSignal.addEventListener('abort', resolve, { once: true }));
-  });
-  const app = await runtime(t, model); await app.login();
-  const originalTimeout = globalThis.setTimeout;
-  t.mock.method(globalThis, 'setTimeout', (callback, ms, ...args) => originalTimeout(callback, ms === 30000 ? 40 : ms, ...args));
-  try {
-    const response = await app.post('/api/chat', chat);
-    const frames = (await response.text()).trim().split('\n').map(line => JSON.parse(line));
-    assert.deepEqual(frames, [{ type: 'error', error: 'Chat failed. Please try again.' }]);
-    assert.equal(signal.aborted, true);
-  } finally { t.mock.restoreAll(); }
-});
-
-test('runtime/chat: excessive streamed text is cut off with generic error', async t => {
-  const model = mockModel([
-    { type: 'text-delta', text: 'x'.repeat(65537) },
+test('runtime/history: NDJSON starts with server ID, commits completed turns, resumes server-only context across instances', async t => {
+  const store = history.createMemoryHistoryStore(); const model = mockModel();
+  const a = await runtime(t, model, shared(store)); const b = await runtime(t, model, shared(store));
+  const response = await a.post({ message: 'First' });
+  assert.equal(response.headers.get('content-type'), 'application/x-ndjson; charset=utf-8');
+  const first = await frames(response);
+  assert.equal(first[0].type, 'conversation'); assert.match(first[0].conversationId, /^[A-Za-z0-9_-]{43}$/);
+  assert.deepEqual(first.slice(1), [{ type: 'delta', text: 'Hello 世界' }, { type: 'done' }]);
+  const conversationId = first[0].conversationId;
+  await turn(b, 'Second', conversationId);
+  assert.deepEqual(model.calls[1].messages.slice(1), [
+    { role: 'user', content: 'First' }, { role: 'assistant', content: 'Hello 世界' }, { role: 'user', content: 'Second' },
   ]);
-  const app = await runtime(t, model); await app.login();
-  const response = await app.post('/api/chat', chat);
-  assert.deepEqual(JSON.parse((await response.text()).trim()), { type: 'error', error: 'Chat failed. Please try again.' });
-  assert.equal(model.calls[0].abortSignal.aborted, true);
+  const fetched = await b.get('/api/conversations/' + conversationId);
+  assert.deepEqual(await fetched.json(), { conversationId, messages: [
+    { role: 'user', content: 'First' }, { role: 'assistant', content: 'Hello 世界' },
+    { role: 'user', content: 'Second' }, { role: 'assistant', content: 'Hello 世界' },
+  ] });
+  const other = (await turn(a, 'Isolated'))[0].conversationId;
+  assert.notEqual(other, conversationId); assert.deepEqual(model.calls.at(-1).messages.slice(1), [{ role: 'user', content: 'Isolated' }]);
+  assert.equal((await b.delete(conversationId)).status, 200);
+  assert.equal((await a.get('/api/conversations/' + conversationId)).status, 404);
+  assert.equal((await a.post({ message: 'Not resurrected', conversationId })).status, 404);
+  assert.equal((await a.delete(conversationId)).status, 404);
+  assert.equal((await a.get('/api/conversations/' + other)).status, 200);
 });
 
-test('runtime/auth: parallel password verification is bounded to two', async t => {
-  const app = await runtime(t);
-  const headers = [];
-  for (let i = 0; i < 3; i++) {
-    const response = await fetch(`${app.base}/api/session`);
-    headers.push({ Cookie: response.headers.get('set-cookie').split(';')[0], 'X-CSRF-Token': (await response.json()).csrf });
+test('runtime/server: strict input bounds exclude client roles/system/model/history and reject unknown conversation before paid work', async t => {
+  const model = mockModel(); const app = await runtime(t, model);
+  for (const input of [{}, { message: '' }, { message: '  ' }, { message: 'x'.repeat(4001) }, { message: 'Hi', conversationId: '../bad' },
+    { messages: [{ role: 'system', content: 'override' }] }, { message: 'Hi', model: 'override' }, { message: 'Hi', messages: [] }]) {
+    assert.equal((await app.post(input)).status, 400);
   }
-  const attempts = await Promise.all(headers.map(header => app.post('/api/login', { password }, header)));
-  assert.deepEqual(attempts.map(response => response.status).sort(), [200, 200, 401]);
+  assert.equal((await app.post({ message: 'Hi' }, { 'Content-Type': 'text/plain' })).status, 415);
+  assert.equal((await app.post({ message: 'x'.repeat(40000) })).status, 413);
+  assert.equal((await app.post({ message: 'Hi', conversationId: id() })).status, 404);
+  assert.equal(model.calls.length, 0);
+  const noModel = await runtime(t, undefined, undefined, { model: undefined });
+  assert.equal((await noModel.post({ message: 'Hi' })).status, 503);
+  assert.equal((await noModel.get('/healthz')).status, 200);
 });
 
-test('runtime/config: generated standalone config rejects unknown secret fields without echoing them', async () => {
-  const path = join(directory, 'fastagent.yaml');
-  const original = await readFile(path, 'utf8');
-  try {
-    await writeFile(path, original + 'apiKey: test-only-secret-config\n');
-    const result = spawnSync(process.execPath, ['dist/main.js'], { cwd: directory, encoding: 'utf8', timeout: 5000, env: { APP_ORIGIN: 'https://chat.example', FASTAGENT_PASSWORD_HASH: passwordHash } });
-    assert.equal(result.status, 1); assert.equal(result.stdout, '');
-    assert.equal(result.stderr, 'Invalid fastagent.yaml configuration.\n');
-    assert.doesNotMatch(result.stderr, /test-only-secret-config/);
-  } finally { await writeFile(path, original); }
+test('runtime/history: errors, whitespace/empty output, tool failure and oversized output never commit; successful commit precedes done', async t => {
+  for (const produce of [
+    async function* () { yield { type: 'text-delta', text: 'partial' }; throw new Error('synthetic-sensitive-provider-detail'); },
+    async function* () { yield { type: 'text-delta', text: 'partial' }; yield { type: 'error' }; },
+    async function* () { yield { type: 'text-delta', text: 'partial' }; yield { type: 'tool-error' }; },
+    async function* () { yield { type: 'text-delta', text: ' '.repeat(2) }; },
+    async function* () {},
+    async function* () { yield { type: 'text-delta', text: 'x'.repeat(65537) }; },
+  ]) {
+    const store = history.createMemoryHistoryStore(); const app = await runtime(t, mockModel(produce), store);
+    const result = await turn(app);
+    assert.equal(result.at(-1).type, 'error'); assert.doesNotMatch(JSON.stringify(result), /synthetic-sensitive/);
+    assert.equal(await store.get(result[0].conversationId), undefined);
+    // Failed reservations release immediately, so ID is reusable as a new server reservation.
+    const owner = id(); await store.acquire(result[0].conversationId, owner, true); await store.release(result[0].conversationId, owner);
+  }
+  const store = history.createMemoryHistoryStore(); let commits = 0;
+  const app = await runtime(t, mockModel(), { ...store, async commit(...args) { commits++; return store.commit(...args); } });
+  const result = await turn(app); assert.equal(result.at(-1).type, 'done'); assert.equal(commits, 1);
+  assert.ok(await store.get(result[0].conversationId));
+  for (const commit of [async () => false, async () => { throw new Error('synthetic-secret-redis-url'); }]) {
+    const raw = history.createMemoryHistoryStore(); const failing = await runtime(t, mockModel(), { ...raw, commit });
+    const result = await turn(failing); assert.equal(result.at(-1).type, 'error'); assert.equal(await raw.get(result[0].conversationId), undefined);
+    assert.doesNotMatch(JSON.stringify(result), /synthetic-secret/);
+  }
 });
 
-test('runtime/agent: upstream SDK warning details are not logged', async t => {
-  const model = mockModel([{ type: 'stream-start', warnings: [{ type: 'other', message: 'test-only-secret-warning' }] }, ...textChunks]);
-  const app = await runtime(t, model); await app.login();
-  const logs = [];
-  t.mock.method(console, 'warn', (...args) => logs.push(args));
-  t.mock.method(process, 'emitWarning', (...args) => logs.push(args));
-  try {
-    const response = await app.post('/api/chat', chat); await response.text();
-    assert.deepEqual(logs, []);
-  } finally { t.mock.restoreAll(); }
+test('runtime/history: disconnect and shutdown abort without persisting partial turns, even for uncooperative model', async t => {
+  for (const shutdown of [false, true]) {
+    const store = history.createMemoryHistoryStore(); let call;
+    let finish;
+    const blocked = new Promise(resolve => { finish = resolve; });
+    const model = mockModel(async function* (value) { call = value; yield { type: 'text-delta', text: 'partial' }; await blocked; yield { type: 'text-delta', text: 'late' }; });
+    const app = await runtime(t, model, store); const controller = new AbortController();
+    const response = await app.post({ message: 'Hi' }, {}, controller.signal);
+    const reader = response.body.getReader(); const { value } = await reader.read();
+    const conversationId = JSON.parse(new TextDecoder().decode(value).split('\n')[0]).conversationId;
+    await waitUntil(() => !!call);
+    if (shutdown) app.abortAll(); else controller.abort();
+    await waitUntil(() => call.abortSignal.aborted);
+    finish(); await reader.cancel().catch(() => {});
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(await store.get(conversationId), undefined);
+    const owner = id(); await store.acquire(conversationId, owner, true); await store.release(conversationId, owner);
+  }
 });
 
-// Separate clients returning deserialized records exercise the remote-store seam, not object identity.
-function sharedClient(store, beforeRotate = async () => {}) {
+test('runtime/history: same-conversation generations/delete conflict across instances, distinct conversations proceed; per-instance max four', async t => {
+  const store = history.createMemoryHistoryStore(); const original = await runtime(t, mockModel(), shared(store));
+  const conversationId = (await turn(original))[0].conversationId;
+  let finish; const gate = new Promise(resolve => { finish = resolve; });
+  const model = mockModel(async function* () { await gate; yield { type: 'text-delta', text: 'completed' }; });
+  const a = await runtime(t, model, shared(store)); const b = await runtime(t, model, shared(store));
+  const first = await a.post({ message: 'Next', conversationId });
+  assert.equal((await b.post({ message: 'Conflict', conversationId })).status, 409);
+  assert.equal((await b.delete(conversationId)).status, 409);
+  assert.equal(model.calls.length, 1);
+  const independent = await b.post({ message: 'Other' });
+  const concurrent = await Promise.all(Array.from({ length: 3 }, (_, i) => a.post({ message: `new-${i}` })));
+  assert.equal((await a.post({ message: 'Overloaded' })).status, 429);
+  assert.equal(model.calls.length, 5);
+  finish();
+  for (const response of [first, independent, ...concurrent]) assert.equal((await frames(response)).at(-1).type, 'done');
+  assert.equal((await b.get('/api/conversations/' + conversationId)).status, 200);
+});
+
+test('runtime/history-store: memory CAS lease expiry/reacquisition, wrong-owner release, retention and capacity recover without eviction', async t => {
+  let now = 1000000; t.mock.method(Date, 'now', () => now);
+  const store = history.createMemoryHistoryStore(); const conversationId = id(), owner = id(), wrong = id();
+  const messages = [{ role: 'user', content: 'Hi' }, { role: 'assistant', content: 'Hello' }];
+  await store.acquire(conversationId, owner, true);
+  assert.equal(await store.commit(conversationId, wrong, messages), false);
+  await store.release(conversationId, wrong);
+  await assert.rejects(store.acquire(conversationId, wrong, true), history.HistoryConflict);
+  now += history.generationLeaseLifetime;
+  assert.equal(await store.commit(conversationId, owner, messages), false);
+  await store.acquire(conversationId, wrong, true);
+  await store.release(conversationId, owner);
+  assert.equal(await store.commit(conversationId, wrong, messages), true);
+  const expires = now + history.historyLifetime;
+  const fetched = await store.get(conversationId); fetched[0].content = 'mutated';
+  assert.deepEqual(await store.get(conversationId), messages);
+  now += 1000; await store.acquire(conversationId, owner, false); await store.release(conversationId, owner);
+  now = expires; assert.equal(await store.get(conversationId), undefined); // Failure/read did not extend expiry.
+  const slots = [];
+  for (let i = 0; i < history.historyCapacity; i++) { const slot = id(); slots.push(slot); await store.acquire(slot, owner, true); }
+  await assert.rejects(store.acquire(id(), owner, true), history.HistoryCapacityExceeded);
+  await store.release(slots[0], owner); await store.acquire(id(), owner, true);
+  now += history.generationLeaseLifetime; await store.acquire(id(), owner, true); // Expired reservations don't leak capacity.
+});
+
+test('runtime/history-store: serialized UTF-8 storage and separate model context are bounded, trimming whole turns only', async () => {
+  let messages = [];
+  for (let i = 0; i < 30; i++) messages = history.completedHistory(messages, String(i), 'response');
+  assert.equal(messages.length, 40); assert.equal(messages[0].content, '10');
+  messages = [];
+  for (let i = 0; i < 10; i++) messages = history.completedHistory(messages, String(i), '世'.repeat(20000));
+  assert.ok(Buffer.byteLength(JSON.stringify(messages)) <= history.historyByteLimit);
+  assert.equal(messages.length % 2, 0);
+  const context = history.modelContext(messages, 'last');
+  assert.deepEqual(context, [{ role: 'user', content: 'last' }]); // Oversized latest turn cannot be split.
+  const small = Array.from({ length: 40 }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', content: 'x'.repeat(1000) }));
+  const bounded = history.modelContext(small, 'z'.repeat(4000));
+  assert.equal(bounded.length, 13); assert.equal(bounded.reduce((sum, item) => sum + item.content.length, 0), 16000);
+  assert.equal(bounded[0].role, 'user'); assert.equal(bounded.at(-1).role, 'user');
+  assert.throws(() => history.validateHistoryMessages([{ role: 'system', content: 'bad' }]), history.HistoryStoreUnavailable);
+});
+
+test('runtime/history: outage fails closed before model, health reports unavailable; recovery reuses stored history', async t => {
+  const store = history.createMemoryHistoryStore(); let unavailable = false;
+  const failing = Object.fromEntries(Object.entries(store).map(([name, fn]) => [name, async (...args) => {
+    if (unavailable && name !== 'close') throw new Error('rediss://synthetic:secret@redis.example');
+    return fn(...args);
+  }]));
+  const model = mockModel(); const app = await runtime(t, model, failing);
+  const conversationId = (await turn(app))[0].conversationId;
+  unavailable = true;
+  for (const response of [await app.get('/healthz'), await app.get('/api/conversations/' + conversationId), await app.delete(conversationId), await app.post({ message: 'Hi', conversationId })]) {
+    assert.equal(response.status, 503); assert.deepEqual(await response.json(), { error: 'Conversation service unavailable. Please try again.' });
+  }
+  assert.equal(model.calls.length, 1);
+  assert.equal((await app.post({ message: 'Hi' }, { Authorization: '' })).status, 401);
+  await assert.rejects(createRuntime({ origin: 'http://localhost:3000', localDev: true, apiToken, model, historyStore: failing }), history.HistoryStoreUnavailable);
+  unavailable = false; await turn(app, 'Recovered', conversationId);
+  assert.equal(model.calls[1].messages[1].content, 'Hi');
+});
+
+test('runtime/config: provider-key selection, exact default, token YAML and stable app history namespace; legacy password config rejected', async () => {
+  const yaml = (model = defaultModel, extra = '') => `schemaVersion: 1\nname: runtime-app\nframework: openai\n${model ? `model: ${model}\n` : ''}deployment:\n  access: token\n${extra}`;
+  const environment = { FASTAGENT_API_TOKEN: apiToken, FASTAGENT_LOCAL_DEV: '1' };
+  const load = (env = {}, code = `import {loadRuntimeConfig} from './dist/config.js'; const c = await loadRuntimeConfig(process.env); console.log(JSON.stringify({configured:!!c.model,namespace:c.historyNamespace}));`) => spawnSync(process.execPath, ['--input-type=module', '-e', code], { cwd: directory, encoding: 'utf8', env: { ...environment, ...env } });
+  for (const [reference, matching, wrong] of [[defaultModel, 'OPENROUTER_API_KEY', 'OPENAI_API_KEY'], ['openai/gpt-4o-mini', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY']]) {
+    await writeFile(join(directory, 'fastagent.yaml'), yaml(reference));
+    for (const [env, configured] of [[{ [wrong]: 'synthetic-wrong-key' }, false], [{ [matching]: 'synthetic-matching-key' }, true]]) {
+      const result = load(env); assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout), { configured, namespace: 'runtime-app' });
+    }
+  }
+  await writeFile(join(directory, 'fastagent.yaml'), yaml(null));
+  let result = load({ OPENROUTER_API_KEY: 'synthetic', FASTAGENT_HISTORY_NAMESPACE: 'stable-app' });
+  assert.equal(result.status, 0, result.stderr); assert.deepEqual(JSON.parse(result.stdout), { configured: true, namespace: 'stable-app' });
+  assert.equal(config.DEFAULT_MODEL_REFERENCE, defaultModel);
+  for (const content of [yaml(defaultModel, 'apiKey: synthetic-sensitive\n'), yaml().replace('access: token', 'access: protected')]) {
+    await writeFile(join(directory, 'fastagent.yaml'), content);
+    result = load({}, `import {loadRuntimeConfig} from './dist/config.js'; try {await loadRuntimeConfig(process.env)} catch(e) {console.error(e.message); process.exitCode=1}`);
+    assert.equal(result.status, 1); assert.equal(result.stderr, 'Invalid fastagent.yaml configuration.\n'); assert.doesNotMatch(result.stderr, /synthetic-sensitive/);
+  }
+  const valid = { origin: 'https://chat.example', localDev: false, apiToken, model: undefined, historyNamespace: 'stable-app', redisUrl: 'rediss://redis.example/0' };
+  config.validateRuntimeConfig(valid);
+  for (const origin of ['', 'http://chat.example', 'https://chat.example/', 'https://user:secret@chat.example', 'https://chat.example/path']) assert.throws(() => config.validateRuntimeConfig({ ...valid, origin }));
+  assert.throws(() => config.validateRuntimeConfig({ ...valid, apiToken: '' }), { message: 'Invalid bearer token configuration.' });
+});
+
+// Reads NDJSON frames incrementally so a test can act between frames: returns the first
+// conversation frame plus a drain function for the remaining response text.
+async function firstFrameThenDrain(response) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = ''; let first;
+  while (first === undefined) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const newline = buffer.indexOf('\n');
+    if (newline >= 0) {
+      const frame = JSON.parse(buffer.slice(0, newline));
+      if (frame.type !== 'conversation') break;
+      first = frame; buffer = buffer.slice(newline + 1);
+    }
+  }
   return {
-    check: () => store.check(),
-    get: async hash => structuredClone(await store.get(hash)),
-    issue: (hash, session) => store.issue(hash, structuredClone(session)),
-    rotate: async (...args) => { await beforeRotate(); return store.rotate(...structuredClone(args)); },
-    revoke: (...args) => store.revoke(...args),
-    async close() {},
+    first,
+    drain: async () => {
+      let text = buffer;
+      while (true) { const { value, done } = await reader.read(); if (done) break; text += decoder.decode(value, { stream: true }); }
+      return text;
+    },
   };
 }
+const lastFrame = text => text.trim().split('\n').filter(Boolean).map(line => JSON.parse(line)).at(-1);
 
-test('runtime/session-store: instance A login works on B; B logout revokes A; shared expiry', async t => {
-  const store = createMemorySessionStore();
-  const a = await runtime(t, mockModel(), true, sharedClient(store));
-  const b = await runtime(t, mockModel(), true, sharedClient(store));
-  await a.login();
-  b.cookie = a.cookie; b.csrf = a.csrf;
-  assert.equal((await b.post('/api/chat', chat)).status, 200);
-  assert.equal((await b.bootstrap()).session.authenticated, true);
-  assert.equal((await b.post('/api/logout', {})).status, 200);
-  assert.equal((await a.post('/api/chat', chat)).status, 401);
-  await a.login(); b.cookie = a.cookie; b.csrf = a.csrf;
-  const now = Date.now(); t.mock.method(Date, 'now', () => now + 3600001);
-  assert.equal((await b.post('/api/chat', chat)).status, 401);
+test('runtime/history: closing one runtime never closes a caller-injected store', async t => {
+  const store = history.createMemoryHistoryStore();
+  const a = await runtime(t, mockModel(), store);
+  const b = await runtime(t, mockModel(), store);
+  const [announced] = await turn(a, 'Hi');
+  assert.equal(announced.type, 'conversation');
+  assert.equal((await b.get('/api/conversations/' + announced.conversationId)).status, 200);
+  await a.closeStore();
+  const after = await b.get('/api/conversations/' + announced.conversationId);
+  assert.equal(after.status, 200, 'an injected store must outlive the runtime that did not create it');
+  assert.equal((await after.json()).messages.length, 2);
 });
 
-test('runtime/session-store: two-instance rotation has one winner; logout or TTL during verification wins', async t => {
-  const store = createMemorySessionStore();
-  const a = createAuth(passwordHash, false, sharedClient(store));
-  const b = createAuth(passwordHash, false, sharedClient(store));
-  const client = await authClient(a, 'shared-peer');
-  const original = { ...client.req, headers: { ...client.req.headers } };
-  const attempts = await Promise.all([a.login(original, client.res, password), b.login(original, client.res, password)]);
-  assert.equal(attempts.filter(Boolean).length, 1);
-  client.update(attempts.find(Boolean));
-  assert.equal(await a.authorize(original), false);
-  assert.equal(await b.authorize(client.req), true);
-  const revoked = createAuth(passwordHash, false, sharedClient(store, async () => {
-    assert.equal(await b.logout(client.req, client.res), true);
-  }));
-  assert.equal(await revoked.login(client.req, client.res, password), undefined);
-  assert.equal(await b.authorize(client.req), false);
-  let now = 1000000; t.mock.method(Date, 'now', () => now);
-  const expiring = createAuth(passwordHash, false, sharedClient(store, async () => { now += 300000; }));
-  const prelogin = await authClient(expiring, 'expiring');
-  assert.equal(await expiring.login(prelogin.req, prelogin.res, password), undefined);
+test('runtime/history: a request aborted before its commit stores nothing and reports an error', async t => {
+  const base = history.createMemoryHistoryStore();
+  let commits = 0;
+  const store = { ...base, async commit(...args) { commits++; return base.commit(...args); } };
+  const model = mockModel(async function* (call) {
+    yield { type: 'text-delta', text: 'partial' };
+    await new Promise(resolve => call.abortSignal.addEventListener('abort', resolve, { once: true }));
+  });
+  const app = await runtime(t, model, store);
+  const response = await app.post({ message: 'Hi' });
+  assert.equal(response.status, 200);
+  const stream = await firstFrameThenDrain(response);
+  app.abortAll();
+  assert.equal(lastFrame(await stream.drain()).type, 'error');
+  assert.equal(commits, 0, 'an aborted request must not start a commit');
+  assert.equal(await base.get(stream.first.conversationId), undefined);
 });
 
-test('runtime/session-store: outages fail closed with safe retryable 503 and no cookies/log secrets', async t => {
-  const store = createMemorySessionStore();
-  let unavailable = false;
-  const secret = 'rediss://test-user:test-only-redis-password@redis.example:6379';
-  const client = sharedClient(store);
-  const failing = Object.fromEntries(Object.keys(client).map(name => [name, async (...args) => {
-    if (unavailable && name !== 'close') throw new Error(secret);
-    return client[name](...args);
-  }]));
-  const app = await runtime(t, mockModel(), true, failing); await app.login();
-  const logs = [];
-  t.mock.method(console, 'error', (...args) => logs.push(args));
-  t.mock.method(console, 'warn', (...args) => logs.push(args));
-  unavailable = true;
-  for (const path of ['/api/session', '/healthz', '/api/login', '/api/logout', '/api/chat']) {
-    const response = ['/api/session', '/healthz'].includes(path)
-      ? await fetch(`${app.base}${path}`, { headers: { Cookie: app.cookie } })
-      : await app.post(path, path === '/api/login' ? { password } : chat);
-    assert.equal(response.status, 503);
-    assert.equal(response.headers.get('set-cookie'), null);
-    assert.deepEqual(await response.json(), { error: 'Session service unavailable. Please try again.' });
-  }
-  assert.equal((await fetch(`${app.base}/api/session`)).status, 503); // No anonymous memory fallback.
-  assert.deepEqual(logs, []);
-  await assert.rejects(createRuntime({ ...app.config, sessionStore: failing }), { message: 'Session service unavailable. Please try again.' });
-  unavailable = false;
-  assert.equal((await app.post('/api/chat', chat)).status, 200); // Existing session survives retry, no local cache.
+test('runtime/history: an abort during an in-flight commit never reports a false failure', async t => {
+  const base = history.createMemoryHistoryStore();
+  let entered; const commitEntered = new Promise(resolve => { entered = resolve; });
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  const store = { ...base, async commit(...args) { entered(); await gate; return base.commit(...args); } };
+  const app = await runtime(t, mockModel(), store);
+  const response = await app.post({ message: 'Hi' });
+  const stream = await firstFrameThenDrain(response);
+  assert.equal(stream.first.type, 'conversation');
+  await commitEntered;
+  app.abortAll();
+  release();
+  // A commit that has already started is atomic and uncancellable, and a successful commit ends lease
+  // ownership, so this sub-atomic window cannot roll back. The response must therefore report the
+  // committed turn instead of claiming a failure for history the store holds. This is the documented
+  // residual; an abort observed before the commit stores nothing (covered by the test above).
+  assert.equal(lastFrame(await stream.drain()).type, 'done');
+  assert.equal((await base.get(stream.first.conversationId)).length, 2);
 });
 
-test('runtime/redis-session-store: runtime config requires production TLS and a stable validated namespace', async () => {
-  const valid = { origin: 'https://chat.example', localDev: false, passwordHash, model: undefined, sessionNamespace: 'shared-app' };
-  validateRuntimeConfig({ ...valid, redisUrl: 'rediss://test-user:test-only-redis-password@redis.example:6379/0' });
-  for (const redisUrl of [undefined, '', 'not-a-url-test-only-secret', 'redis://redis.example',
-    'https://user:test-only-secret@redis.example', 'rediss://redis.example/0?password=test-only-secret', 'rediss://redis.example/bad',
-    ' rediss://redis.example', 'rediss://user:%zz@redis.example', 'rediss://redis.example/9999999999999999999']) {
-    assert.throws(() => validateRuntimeConfig({ ...valid, redisUrl }), { message: 'REDIS_URL must configure Redis with TLS in production.' });
-  }
-  for (const namespace of ['', 'UPPER', 'bad/id', '{app}', 'x'.repeat(64)]) {
-    assert.throws(() => validateRedisConfig('rediss://redis.example', namespace, false), { message: 'Invalid session namespace configuration.' });
-  }
-  validateRedisConfig(undefined, 'local-app', true);
-  validateRedisConfig('redis://127.0.0.1:6379', 'local-app', true);
-  const env = { APP_ORIGIN: valid.origin, FASTAGENT_PASSWORD_HASH: passwordHash };
-  for (const changed of [{}, { REDIS_URL: 'redis://user:test-only-redis-password@redis.example' },
-    { REDIS_URL: 'rediss://redis.example', FASTAGENT_SESSION_NAMESPACE: 'bad/test-only-secret' }]) {
-    const result = spawnSync(process.execPath, ['dist/main.js'], { cwd: directory, encoding: 'utf8', timeout: 5000, env: { ...env, ...changed } });
-    assert.equal(result.status, 1); assert.equal(result.stdout, '');
-    assert.match(result.stderr, /^(REDIS_URL must configure Redis with TLS in production\.|Invalid session namespace configuration\.)\n$/);
-    assert.doesNotMatch(result.stderr, /test-only|redis\.example|user:/);
-  }
-  for (const override of [undefined, 'stable-app']) {
-    const code = `import {loadRuntimeConfig} from './dist/config.js'; console.log((await loadRuntimeConfig(process.env)).sessionNamespace);`;
-    const result = spawnSync(process.execPath, ['--input-type=module', '-e', code], { cwd: directory, encoding: 'utf8', env: {
-      ...env, REDIS_URL: 'rediss://test-user:test-only-redis-password@redis.example',
-      ...(override ? { FASTAGENT_SESSION_NAMESPACE: override } : {}),
-    } });
-    assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stdout.trim(), override ?? 'agent');
-    assert.equal(result.stderr, ''); // Config loading never connects.
-  }
-});
-
-test('runtime/redis-session-store: actual library connection errors and stalled handshake are bounded and sanitized', async t => {
-  const logs = []; const sockets = new Set();
-  t.mock.method(console, 'error', (...args) => logs.push(args));
-  t.mock.method(console, 'warn', (...args) => logs.push(args));
-  let mode = 'error';
-  const server = createTcpServer(socket => {
-    sockets.add(socket); socket.on('close', () => sockets.delete(socket)); socket.on('error', () => {});
-    socket.on('data', () => {
-      if (mode === 'error') socket.end('-ERR rediss://test-user:test-only-redis-password@redis.example\r\n');
-    });
-  });
-  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  t.after(async () => {
-    for (const socket of sockets) socket.destroy();
-    await new Promise(resolve => server.close(resolve));
-  });
-  const url = `redis://test-user:test-only-redis-password@127.0.0.1:${server.address().port}`;
-  await assert.rejects(createRedisSessionStore(url, 'test-app', true), { message: 'Session service unavailable. Please try again.' });
-  mode = 'stalled';
-  const originalTimeout = globalThis.setTimeout;
-  t.mock.method(globalThis, 'setTimeout', (callback, ms, ...args) => originalTimeout(callback, ms === 3000 ? 40 : ms, ...args));
-  await assert.rejects(createRedisSessionStore(url, 'test-app', true), { message: 'Session service unavailable. Please try again.' });
-  assert.deepEqual(logs, []);
-});
-
-// Minimal local RESP transport double: exercises node-redis reconnection, not Redis Lua semantics.
-function consumeResp(buffer) {
-  const first = buffer.indexOf('\r\n');
-  if (first < 0) return;
-  const count = Number(buffer.subarray(1, first).toString());
-  if (buffer[0] !== 42 || !Number.isInteger(count)) throw new Error('Unexpected test RESP frame');
-  let offset = first + 2; const args = [];
-  for (let i = 0; i < count; i++) {
-    const end = buffer.indexOf('\r\n', offset); if (end < 0) return;
-    const size = Number(buffer.subarray(offset + 1, end).toString());
-    if (buffer.length < end + 2 + size + 2) return;
-    args.push(buffer.subarray(end + 2, end + 2 + size).toString()); offset = end + 2 + size + 2;
-  }
-  return { args, offset };
-}
-
-test('runtime/redis-session-store: get and CAS use the same atomic index-validation command; zero is invalid', async t => {
-  // Transport contract only: the opt-in integration suite exercises real Lua semantics.
-  const sockets = new Set(); const commands = [];
-  const server = createTcpServer(socket => {
-    sockets.add(socket); socket.on('close', () => sockets.delete(socket)); socket.on('error', () => {});
-    let buffer = Buffer.alloc(0);
-    socket.on('data', chunk => {
-      buffer = Buffer.concat([buffer, chunk]); let frame;
-      while ((frame = consumeResp(buffer))) {
-        buffer = buffer.subarray(frame.offset);
-        const command = frame.args[0].toUpperCase();
-        commands.push(frame.args);
-        socket.write(command === 'EVAL' ? ':0\r\n' : '+OK\r\n');
-      }
-    });
-  });
-  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  let store;
-  t.after(async () => {
-    await store?.close(); for (const socket of sockets) socket.destroy();
-    await new Promise(resolve => server.close(resolve));
-  });
-  store = await createRedisSessionStore(`redis://127.0.0.1:${server.address().port}`, 'test-consistency', true);
-  const hash = 'a'.repeat(64); const replacement = 'b'.repeat(64); const csrf = 'c'.repeat(43);
-  assert.equal(await store.get(hash), undefined);
-  assert.equal(await store.rotate(hash, csrf, replacement, { csrf, authenticated: true, expires: Date.now() + 3600000 }), false);
-  assert.equal(await store.revoke(hash, csrf), false);
-  assert.equal(commands.some(args => args[0].toUpperCase() === 'GET'), false);
-  const evaluations = commands.filter(args => args[0].toUpperCase() === 'EVAL');
-  assert.equal(evaluations.length, 3);
-  const prefix = 'fastagent:{test-consistency}:sessions:';
-  assert.deepEqual(evaluations[0].slice(2), ['3', prefix + 'authenticated', prefix + 'anonymous', prefix + hash, 'get']);
-  for (const args of evaluations.slice(1)) {
-    assert.equal(args[1], evaluations[0][1], 'CAS independently executes the same validator');
-    assert.deepEqual(args.slice(2, 6), ['4', prefix + 'authenticated', prefix + 'anonymous', prefix + hash]);
-  }
-  assert.equal(evaluations[1][6], prefix + replacement);
-  assert.equal(evaluations[1][7], 'rotate');
-  assert.equal(evaluations[2][7], 'revoke');
-});
-
-test('runtime/redis-session-store: native outage recovery resumes requests; shutdown stops pending reconnect', async t => {
-  const sockets = new Set(); let outage = false; let connections = 0;
-  const session = { csrf: 'a'.repeat(43), authenticated: true, expires: Date.now() + 3600000 };
-  const value = JSON.stringify(session);
-  const server = createTcpServer(socket => {
-    connections++; sockets.add(socket); socket.on('close', () => sockets.delete(socket)); socket.on('error', () => {});
-    if (outage) { socket.destroy(); return; }
-    let buffer = Buffer.alloc(0);
-    socket.on('data', chunk => {
-      buffer = Buffer.concat([buffer, chunk]); let frame;
-      while ((frame = consumeResp(buffer))) {
-        buffer = buffer.subarray(frame.offset);
-        const command = frame.args[0].toUpperCase();
-        // EVAL's result is stubbed only for transport recovery; no Lua is evaluated here.
-        socket.write(command === 'PING' ? '+PONG\r\n' : command === 'EVAL'
-          ? `$${Buffer.byteLength(value)}\r\n${value}\r\n` : '+OK\r\n');
-      }
-    });
-  });
-  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  let store;
-  t.after(async () => {
-    await store?.close(); for (const socket of sockets) socket.destroy();
-    await new Promise(resolve => server.close(resolve));
-  });
-  store = await createRedisSessionStore(`redis://127.0.0.1:${server.address().port}`, 'test-recovery', true);
-  await store.check(); assert.deepEqual(await store.get('a'.repeat(64)), session);
-  outage = true; for (const socket of sockets) socket.destroy();
-  await new Promise(resolve => setTimeout(resolve, 20));
-  await assert.rejects(store.check(), { message: 'Session service unavailable. Please try again.' });
-  await assert.rejects(store.get('a'.repeat(64)), { message: 'Session service unavailable. Please try again.' });
-  outage = false;
-  const deadline = Date.now() + 3000; let recovered = false;
-  while (Date.now() < deadline) {
-    try { await store.check(); recovered = true; break; } catch {}
-    await new Promise(resolve => setTimeout(resolve, 20));
-  }
-  assert.equal(recovered, true); assert.ok(connections >= 2);
-  assert.deepEqual(await store.get('a'.repeat(64)), session);
-  outage = true; for (const socket of sockets) socket.destroy();
-  await new Promise(resolve => setTimeout(resolve, 150)); // Leave the native retry loop pending.
-  await store.close(); const closedConnections = connections;
-  outage = false;
-  await new Promise(resolve => setTimeout(resolve, 500));
-  assert.equal(connections, closedConnections);
-  await assert.rejects(store.check(), { message: 'Session service unavailable. Please try again.' });
+test('runtime/history: an owner holding the lease may delete, an unowned delete still conflicts', async () => {
+  const store = history.createMemoryHistoryStore();
+  const conversationId = randomBytes(32).toString('base64url');
+  const first = randomBytes(32).toString('base64url');
+  const second = randomBytes(32).toString('base64url');
+  await store.acquire(conversationId, first, true);
+  await store.commit(conversationId, first, [{ role: 'user', content: 'Hi' }, { role: 'assistant', content: 'Hello' }]);
+  // A second generation on the stored conversation holds the lease, as it would mid-commit.
+  await store.acquire(conversationId, second, false);
+  await assert.rejects(() => store.delete(conversationId), (error) => error instanceof history.HistoryConflict);
+  // A stale owner who no longer holds the lease must not be able to delete stored history.
+  await assert.rejects(() => store.delete(conversationId, first), (error) => error instanceof history.HistoryConflict);
+  assert.equal(await store.delete(conversationId, second), true);
+  assert.equal(await store.get(conversationId), undefined);
+  await store.release(conversationId, second);
+  // With no live lease, an owner-bearing delete is unauthorized while ordinary deletion is allowed.
+  await store.acquire(conversationId, first, true);
+  await store.commit(conversationId, first, [{ role: 'user', content: 'Hi' }, { role: 'assistant', content: 'Hello' }]);
+  await assert.rejects(() => store.delete(conversationId, second), (error) => error instanceof history.HistoryConflict);
+  assert.equal(await store.delete(conversationId), true);
 });

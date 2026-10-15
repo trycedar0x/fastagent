@@ -2,7 +2,8 @@ import { constants } from 'node:fs';
 import { lstat, mkdir, mkdtemp, open, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { parseConfig, serializeConfig, type ProjectConfig } from '../config/config.js';
+import { isDeployableModel, parseConfig, serializeConfig, type ProjectConfig } from '../config/config.js';
+import { isApprovedDockerfile } from './dockerfiles.js';
 import { FastagentError } from '../errors.js';
 
 export interface StagedSource {
@@ -121,8 +122,8 @@ export async function stageDeploymentSource(options: StagingOptions): Promise<St
       } finally { await handle.close(); }
     };
     const config = parseConfig((await read('fastagent.yaml')).toString('utf8'));
-    // The current runtime supports only OpenAI model IDs; reject accidental config credentials.
-    if (!/^openai\/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(config.model)) throw fail();
+    // Protected apps keep the published OpenAI ID check. Token apps use the model-reference grammar.
+    if (!isDeployableModel(config)) throw fail();
     await write('fastagent.yaml', serializeConfig(config));
     const approvedHandle = await open(new URL('../../templates/openai/Dockerfile', import.meta.url), constants.O_RDONLY);
     let approvedDockerfile: string;
@@ -134,7 +135,7 @@ export async function stageDeploymentSource(options: StagingOptions): Promise<St
         catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue; throw error; }
       }
       const content = await read(path);
-      if (path === 'Dockerfile' && content.toString('utf8').replaceAll('\r\n', '\n').trim() !== approvedDockerfile.trim()) throw fail('DEPLOYMENT_DOCKERFILE_UNSUPPORTED');
+      if (path === 'Dockerfile' && !isApprovedDockerfile(content.toString('utf8'), approvedDockerfile)) throw fail('DEPLOYMENT_DOCKERFILE_UNSUPPORTED');
       if (path.endsWith('.json')) {
         let value: unknown;
         try { value = JSON.parse(content.toString('utf8')); } catch { throw fail(); }
@@ -165,7 +166,14 @@ export async function stageDeploymentSource(options: StagingOptions): Promise<St
       const after = await lstat(join(project, path));
       if (!after.isDirectory() || before.ino !== after.ino || before.dev !== after.dev) throw fail();
     };
-    await visit('src'); await visit('public');
+    await visit('src');
+    let publicInfo;
+    try { publicInfo = await lstat(join(project, 'public')); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    if (publicInfo) {
+      if (publicInfo.isSymbolicLink() || !publicInfo.isDirectory()) throw fail();
+      await visit('public');
+    }
     for (const ignore of ['.dockerignore', '.railwayignore', '.gcloudignore']) await write(ignore, deploymentIgnoreFile);
     const stagedDirectory = directory;
     return { directory: stagedDirectory, config, files, bytes, cleanup: () => rm(stagedDirectory, { recursive: true, force: true }) };

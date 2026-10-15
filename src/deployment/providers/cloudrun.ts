@@ -1,10 +1,11 @@
 import { readFile } from 'node:fs/promises';
 import { FastagentError } from '../../errors.js';
 import { createDeploymentRecord, deploymentKey, validateDeploymentRecord, type DeploymentRecord } from '../state.js';
-import { validateCloudEnvironment, validateHttpsOrigin, validatePreflightEnvironment,
-  type DeploymentProvider, type DeployInput, type ProviderContext, type PreflightEnvironment } from '../types.js';
+import { isApprovedDockerfile } from '../dockerfiles.js';
+import { redisNamespace, redisNamespaceVariable, runtimeSecretKeys, secretValue, validateCloudEnvironment, validateHttpsOrigin, validatePreflightEnvironment,
+  type DeploymentProvider, type DeployInput, type PreflightEnvironment, type ProviderContext } from '../types.js';
 
-const keys = ['FASTAGENT_PASSWORD_HASH', 'OPENAI_API_KEY', 'REDIS_URL'] as const;
+const knownSecretKeys = ['FASTAGENT_PASSWORD_HASH', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'FASTAGENT_API_TOKEN', 'REDIS_URL'] as const;
 const ownerLabel = 'fastagent-owner';
 const fail = (code: string) => new FastagentError(code,
   'Cloud Run operation could not be verified. Check gcloud permissions/prerequisites and the recorded resource IDs before retrying; uncertain mutations are not automatically recreated.');
@@ -119,10 +120,10 @@ export function createCloudRunProvider(options: CloudRunOptions): DeploymentProv
   const serviceId = `projects/${options.project}/locations/${options.region}/services/${options.service}`;
   // Metadata and its current pinned version are separate owned secret identities in core state.
   // Older versions remain until destroy deletes the parent once and proves absence for both.
-  const secretId = (record: DeploymentRecord, key: typeof keys[number]) =>
+  const secretId = (record: DeploymentRecord, key: string) =>
     `projects/${options.project}/secrets/fa-${record.ownershipMarker}-${key.toLowerCase().replaceAll('_', '-')}`;
   const metadataSecrets = (record: DeploymentRecord) => record.resources.filter((r) => r.kind === 'secret' && !r.id.includes('/versions/'));
-  function version(record: DeploymentRecord, key: typeof keys[number]) {
+  function version(record: DeploymentRecord, key: string) {
     const prefix = `${secretId(record, key)}/versions/`;
     const found = record.resources.filter((r) => r.kind === 'secret' && r.id.startsWith(prefix));
     if (found.length !== 1 || !/^[1-9]\d*$/.test(found[0]!.id.slice(prefix.length))) throw fail('CLOUDRUN_PARTIAL_TARGET');
@@ -135,12 +136,12 @@ export function createCloudRunProvider(options: CloudRunOptions): DeploymentProv
         record.resources.some((r) => {
           if (r.kind === 'project') return r.id !== options.project || r.ownership !== 'external';
           if (r.kind === 'service') return r.id !== serviceId || r.ownership !== 'owned';
-          if (r.kind === 'secret') return r.ownership !== 'owned' || !keys.some((key) => r.id === secretId(record, key) ||
+          if (r.kind === 'secret') return r.ownership !== 'owned' || !knownSecretKeys.some((key) => r.id === secretId(record, key) ||
             new RegExp(`^${secretId(record, key)}/versions/[1-9]\\d*$`).test(r.id));
           if (r.kind === 'revision') return r.ownership !== 'external' || !new RegExp(`^${options.service}-[a-z0-9-]+$`).test(r.id);
           return true;
         }) || record.resources.filter((r) => r.kind === 'revision').length > 1 || record.resources.filter((r) => r.kind === 'service').length > 1 ||
-        keys.some((key) => record.resources.filter((r) => r.id.startsWith(`${secretId(record, key)}/versions/`)).length > 1)) throw fail('CLOUDRUN_TARGET_MISMATCH');
+        knownSecretKeys.some((key) => record.resources.filter((r) => r.id.startsWith(`${secretId(record, key)}/versions/`)).length > 1)) throw fail('CLOUDRUN_TARGET_MISMATCH');
     return record;
   }
   async function cliReady(context: ProviderContext) {
@@ -210,6 +211,19 @@ export function createCloudRunProvider(options: CloudRunOptions): DeploymentProv
     if (url !== expected) throw fail('CLOUDRUN_ORIGIN_MISMATCH');
     return url;
   }
+  function runtimeContract(names: readonly string[]) {
+    const password = names.includes('FASTAGENT_PASSWORD_HASH');
+    const token = names.includes('FASTAGENT_API_TOKEN');
+    if (password && token) throw fail('CLOUDRUN_UNSAFE_REMOTE_ENV');
+    if (token) {
+      const modelKeys = ['OPENAI_API_KEY', 'OPENROUTER_API_KEY'].filter((key) => names.includes(key));
+      if (modelKeys.length !== 1 || names.includes('FASTAGENT_SESSION_NAMESPACE')) throw fail('CLOUDRUN_UNSAFE_REMOTE_ENV');
+      const secrets = ['FASTAGENT_API_TOKEN', modelKeys[0]!, 'REDIS_URL'];
+      return { secrets, namespace: 'FASTAGENT_HISTORY_NAMESPACE', allowed: [...secrets, 'APP_ORIGIN', 'FASTAGENT_HISTORY_NAMESPACE', 'PORT'] };
+    }
+    const secrets = ['FASTAGENT_PASSWORD_HASH', 'OPENAI_API_KEY', 'REDIS_URL'];
+    return { secrets, namespace: 'FASTAGENT_SESSION_NAMESPACE', allowed: [...secrets, 'APP_ORIGIN', 'FASTAGENT_SESSION_NAMESPACE', 'PORT'] };
+  }
   function config(remote: Record<string, unknown>, record: DeploymentRecord, checkOrigin = true) {
     ownedService(remote, record);
     if (!record.url) throw fail('CLOUDRUN_ORIGIN_MISMATCH');
@@ -222,11 +236,12 @@ export function createCloudRunProvider(options: CloudRunOptions): DeploymentProv
     const container = containers[0]!;
     const env = list(container.env).map(obj);
     const names = env.map((e) => text(e.name));
-    if (new Set(names).size !== names.length || names.some((name) => ![...keys, 'APP_ORIGIN', 'FASTAGENT_SESSION_NAMESPACE', 'PORT'].includes(name))) throw fail('CLOUDRUN_UNSAFE_REMOTE_ENV');
+    const contract = runtimeContract(names);
+    if (new Set(names).size !== names.length || names.some((name) => !contract.allowed.includes(name))) throw fail('CLOUDRUN_UNSAFE_REMOTE_ENV');
     const value = (key: string) => env.find((e) => e.name === key);
-    if (value('APP_ORIGIN')?.value !== record.url || value('FASTAGENT_SESSION_NAMESPACE')?.value !== record.sessionNamespace ||
+    if (value('APP_ORIGIN')?.value !== record.url || value(contract.namespace)?.value !== record.sessionNamespace ||
         (value('PORT') && value('PORT')?.value !== '8080') || list(container.ports).length !== 1 || obj(list(container.ports)[0]).containerPort !== 8080) throw fail('CLOUDRUN_CONFIG_MISMATCH');
-    for (const key of keys) {
+    for (const key of contract.secrets) {
       const entry = value(key);
       if (!entry || 'value' in entry) throw fail('CLOUDRUN_UNSAFE_REMOTE_ENV');
       const ref = obj(obj(entry.valueFrom).secretKeyRef);
@@ -282,11 +297,11 @@ export function createCloudRunProvider(options: CloudRunOptions): DeploymentProv
     let record = await input.state.read();
     if (record) {
       record = recordFor(input, record);
-      if (record.status === 'destroying' || record.sessionNamespace !== environment.FASTAGENT_SESSION_NAMESPACE) throw fail('CLOUDRUN_TARGET_MISMATCH');
-    } else record = { ...createDeploymentRecord(input.selector), sessionNamespace: environment.FASTAGENT_SESSION_NAMESPACE,
+      if (record.status === 'destroying' || record.sessionNamespace !== redisNamespace(environment)) throw fail('CLOUDRUN_TARGET_MISMATCH');
+    } else record = { ...createDeploymentRecord(input.selector), sessionNamespace: redisNamespace(environment),
       selectors: { project: options.project, region: options.region }, resources: [{ kind: 'project', id: options.project, ownership: 'external' }] };
     const approved = await readFile(new URL('../../../templates/openai/Dockerfile', import.meta.url), 'utf8');
-    if ((await readFile(`${input.source.directory}/Dockerfile`, 'utf8')).replaceAll('\r\n', '\n').trim() !== approved.trim() ||
+    if (!isApprovedDockerfile(await readFile(`${input.source.directory}/Dockerfile`, 'utf8'), approved) ||
         !input.source.files.includes('.gcloudignore')) throw fail('CLOUDRUN_SOURCE_UNSUPPORTED');
     const predicted = await prepare(input, environment);
     const expires = Date.now() + deadline;
@@ -314,7 +329,8 @@ export function createCloudRunProvider(options: CloudRunOptions): DeploymentProv
     const unversioned = metadataSecrets(record).filter((r) => !record!.resources.some((v) => v.id.startsWith(`${r.id}/versions/`)));
     if (recovery && record.phase === 'resources-created' && unversioned.length !== 1) throw fail('CLOUDRUN_MUTATION_UNCERTAIN');
     if (!recovery || !['secrets-configured', 'source-uploaded'].includes(record.phase)) {
-      for (const key of keys) {
+      const secretKeys = runtimeSecretKeys(environment);
+      for (const key of secretKeys) {
         remaining();
         const id = secretId(record, key);
         if (recovery && record.resources.some((r) => r.id.startsWith(`${id}/versions/`))) {
@@ -344,7 +360,7 @@ export function createCloudRunProvider(options: CloudRunOptions): DeploymentProv
         }
         if (!pinned) {
           await save({ phase: 'resources-created', status: 'deploying' });
-          const added = obj(parse(await command(input, ['secrets', 'versions', 'add', id, '--data-file=-', '--quiet', '--format=json'], 'mutate', environment[key])));
+          const added = obj(parse(await command(input, ['secrets', 'versions', 'add', id, '--data-file=-', '--quiet', '--format=json'], 'mutate', secretValue(environment, key))));
           pinned = canonicalSecretName(text(added.name));
           if (added.state !== 'ENABLED') throw fail('CLOUDRUN_SECRET_VERSION_INVALID');
         }
@@ -356,11 +372,11 @@ export function createCloudRunProvider(options: CloudRunOptions): DeploymentProv
       await save({ phase: 'secrets-configured', status: 'pending' });
     }
     async function upload(selectedOrigin: string, update: boolean) {
-      const references = keys.map((key) => `${key}=${secretId(record!, key).split('/').at(-1)}:${version(record!, key)}`).join(',');
+      const references = runtimeSecretKeys(environment).map((key) => `${key}=${secretId(record!, key).split('/').at(-1)}:${version(record!, key)}`).join(',');
       const response = obj(parse(await command(input, ['run', 'deploy', options.service, '--region', options.region, '--source', input.source.directory,
         '--service-account', options.runtimeServiceAccount, '--build-service-account', buildAccountId,
         '--port=8080', '--max=1', '--max-instances=1', '--timeout=300', '--concurrency=20',
-        '--set-env-vars', `APP_ORIGIN=${selectedOrigin},FASTAGENT_SESSION_NAMESPACE=${record!.sessionNamespace}`,
+        '--set-env-vars', `APP_ORIGIN=${selectedOrigin},${redisNamespaceVariable(environment)}=${record!.sessionNamespace}`,
         '--set-secrets', references, '--labels', `${ownerLabel}=${record!.ownershipMarker}`, '--invoker-iam-check', '--deploy-health-check',
         ...(update ? ['--no-traffic'] : ['--no-allow-unauthenticated']), '--quiet', '--format=json'], 'mutate', undefined, input.selector.projectPath, remaining())));
       ownedService(response, record!);

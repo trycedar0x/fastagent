@@ -5,7 +5,7 @@ Each diagram has an editable `.excalidraw` source and an SVG preview. The previe
 | Diagram | What it explains | Source | Preview |
 | --- | --- | --- | --- |
 | Workflow | Local setup, deployment, and inspection | [Edit](workflow.excalidraw) | [View](workflow.svg) |
-| Architecture | Local CLI, deployed app, OpenAI, and shared Redis sessions | [Edit](architecture.excalidraw) | [View](architecture.svg) |
+| Architecture | Local CLI, deployed app, model provider, and shared Redis conversation history | [Edit](architecture.excalidraw) | [View](architecture.svg) |
 | Deployment | Runtime secrets, provider authentication, and filtered source upload | [Edit](deployment.excalidraw) | [View](deployment.svg) |
 
 ## Edit a diagram

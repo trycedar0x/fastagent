@@ -17,40 +17,99 @@ export function validateHttpsOrigin(value: string): string {
   }
 }
 
-const cloudEnvironmentSchema = z.strictObject({
+const secretText = z.string().min(1).max(8192).regex(/^[^\s\x00-\x1f\x7f]+$/);
+const protectedCloudSchema = z.strictObject({
   FASTAGENT_PASSWORD_HASH: z.string().regex(/^scrypt-v1\$[a-f0-9]{32}\$[a-f0-9]{128}$/),
-  OPENAI_API_KEY: z.string().min(1).max(8192).regex(/^[^\s\x00-\x1f\x7f]+$/),
+  OPENAI_API_KEY: secretText,
   REDIS_URL: z.string().min(1).max(8192),
   APP_ORIGIN: z.string(),
   FASTAGENT_SESSION_NAMESPACE: projectNameSchema,
 });
-export type CloudEnvironment = z.infer<typeof cloudEnvironmentSchema>;
-const preflightEnvironmentSchema = cloudEnvironmentSchema.extend({ APP_ORIGIN: z.string().optional() });
-export type PreflightEnvironment = z.infer<typeof preflightEnvironmentSchema>;
+const tokenCloudSchema = z.strictObject({
+  FASTAGENT_API_TOKEN: z.string().regex(/^[A-Za-z0-9_-]{43,256}$/),
+  OPENAI_API_KEY: secretText.optional(),
+  OPENROUTER_API_KEY: secretText.optional(),
+  REDIS_URL: z.string().min(1).max(8192),
+  APP_ORIGIN: z.string(),
+  FASTAGENT_HISTORY_NAMESPACE: projectNameSchema,
+});
+export type ProtectedEnvironment = z.infer<typeof protectedCloudSchema>;
+export type TokenEnvironment = z.infer<typeof tokenCloudSchema>;
+export type CloudEnvironment = ProtectedEnvironment | TokenEnvironment;
+const protectedPreflightSchema = protectedCloudSchema.extend({ APP_ORIGIN: z.string().optional() });
+const tokenPreflightSchema = tokenCloudSchema.extend({ APP_ORIGIN: z.string().optional() });
+export type PreflightEnvironment = z.infer<typeof protectedPreflightSchema> | z.infer<typeof tokenPreflightSchema>;
 
-/** Explicit input only: no dotenv or ambient credential reads. Never serialize this result to state. */
-export function validatePreflightEnvironment(value: unknown): PreflightEnvironment {
-  const result = preflightEnvironmentSchema.safeParse(value);
-  if (!result.success) throw new FastagentError('DEPLOYMENT_ENV_INVALID',
-    'Cloud preflight requires a password hash, model key, TLS Redis URL and stable session namespace; local development and unknown variables are forbidden.');
-  if (result.data.APP_ORIGIN !== undefined) validateHttpsOrigin(result.data.APP_ORIGIN);
+type ModelKeyEnvironment = { OPENAI_API_KEY?: string | undefined; OPENROUTER_API_KEY?: string | undefined };
+function oneModelKey(value: ModelKeyEnvironment): boolean {
+  return Number(Boolean(value.OPENAI_API_KEY)) + Number(Boolean(value.OPENROUTER_API_KEY)) === 1;
+}
+function cleanToken<T extends ModelKeyEnvironment & { APP_ORIGIN?: string | undefined }>(value: T): T {
+  const cleaned = { ...value };
+  if (!cleaned.OPENAI_API_KEY) delete cleaned.OPENAI_API_KEY;
+  if (!cleaned.OPENROUTER_API_KEY) delete cleaned.OPENROUTER_API_KEY;
+  if (cleaned.APP_ORIGIN === undefined) delete cleaned.APP_ORIGIN;
+  return cleaned;
+}
+function validateRedisUrl(raw: string): void {
   try {
-    const raw = result.data.REDIS_URL;
     const url = new URL(raw);
     decodeURIComponent(url.username); decodeURIComponent(url.password);
     if (/[\x00-\x20\x7f]/.test(raw) || url.protocol !== 'rediss:' || !url.hostname || url.hash || url.search ||
         !/^(?:\/(?:\d+)?)?$/.test(url.pathname) ||
         (url.pathname.length > 1 && !Number.isSafeInteger(Number(url.pathname.slice(1))))) throw new Error();
   } catch { throw new FastagentError('DEPLOYMENT_ENV_INVALID', 'Cloud runtime requires a valid TLS Redis URL.'); }
-  return result.data;
+}
+function parsePreflight(value: unknown): PreflightEnvironment | undefined {
+  const protectedResult = protectedPreflightSchema.safeParse(value);
+  if (protectedResult.success) return protectedResult.data;
+  const tokenResult = tokenPreflightSchema.safeParse(value);
+  if (tokenResult.success && oneModelKey(tokenResult.data)) return cleanToken(tokenResult.data);
+  return undefined;
+}
+function parseCloud(value: unknown): CloudEnvironment | undefined {
+  const protectedResult = protectedCloudSchema.safeParse(value);
+  if (protectedResult.success) return protectedResult.data;
+  const tokenResult = tokenCloudSchema.safeParse(value);
+  if (tokenResult.success && oneModelKey(tokenResult.data)) return cleanToken(tokenResult.data);
+  return undefined;
+}
+
+export function isTokenRuntime(environment: PreflightEnvironment): environment is z.infer<typeof tokenPreflightSchema> {
+  return 'FASTAGENT_API_TOKEN' in environment;
+}
+export function redisNamespace(environment: PreflightEnvironment): string {
+  return isTokenRuntime(environment) ? environment.FASTAGENT_HISTORY_NAMESPACE : environment.FASTAGENT_SESSION_NAMESPACE;
+}
+export function redisNamespaceVariable(environment: PreflightEnvironment): 'FASTAGENT_HISTORY_NAMESPACE' | 'FASTAGENT_SESSION_NAMESPACE' {
+  return isTokenRuntime(environment) ? 'FASTAGENT_HISTORY_NAMESPACE' : 'FASTAGENT_SESSION_NAMESPACE';
+}
+export function runtimeSecretKeys(environment: PreflightEnvironment): string[] {
+  if (!isTokenRuntime(environment)) return ['FASTAGENT_PASSWORD_HASH', 'OPENAI_API_KEY', 'REDIS_URL'];
+  return ['FASTAGENT_API_TOKEN', environment.OPENROUTER_API_KEY ? 'OPENROUTER_API_KEY' : 'OPENAI_API_KEY', 'REDIS_URL'];
+}
+export function secretValue(environment: PreflightEnvironment, key: string): string {
+  const value = (environment as unknown as Record<string, string | undefined>)[key];
+  if (!value) throw new FastagentError('DEPLOYMENT_ENV_INVALID', 'Cloud runtime secret is missing.');
+  return value;
+}
+
+/** Explicit input only: no dotenv or ambient credential reads. Never serialize this result to state. */
+export function validatePreflightEnvironment(value: unknown): PreflightEnvironment {
+  const parsed = parsePreflight(value);
+  if (!parsed) throw new FastagentError('DEPLOYMENT_ENV_INVALID',
+    'Cloud preflight requires TLS Redis, a stable namespace, and either a password hash plus OpenAI key for an existing protected app, or a bearer token plus the model key selected by fastagent.yaml. Local development and unknown variables are forbidden.');
+  if (parsed.APP_ORIGIN !== undefined) validateHttpsOrigin(parsed.APP_ORIGIN);
+  validateRedisUrl(parsed.REDIS_URL);
+  return parsed;
 }
 
 /** Required after domain acquisition, before activating any chat revision. No placeholder origin. */
 export function validateCloudEnvironment(value: unknown): CloudEnvironment {
-  const result = cloudEnvironmentSchema.safeParse(value);
-  if (!result.success) throw new FastagentError('DEPLOYMENT_ENV_INVALID', 'Cloud runtime requires exact APP_ORIGIN as well as validated preflight secrets and namespace.');
-  validatePreflightEnvironment(result.data);
-  return result.data;
+  const parsed = parseCloud(value);
+  if (!parsed) throw new FastagentError('DEPLOYMENT_ENV_INVALID', 'Cloud runtime requires exact APP_ORIGIN as well as validated preflight secrets and namespace.');
+  validatePreflightEnvironment(parsed);
+  return parsed;
 }
 
 export interface ProviderContext {

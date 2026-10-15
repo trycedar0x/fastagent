@@ -13,7 +13,9 @@
 
 Build a chat-agent deployment CLI, not a coding agent, sandbox, or hosted billing platform.
 
-Use TypeScript, Node.js 22+, npm, ESM, and the official OpenAI SDK. The template ID is `openai`. Do not add Vercel AI SDK, Next.js, or another adapter without approval.
+Use TypeScript, Node.js 22+, npm, ESM, and the official OpenAI SDK. The template ID is `openai`. That adapter serves both `openrouter/<vendor>/<model>` and direct `openai/<model>`, selecting `OPENROUTER_API_KEY` or `OPENAI_API_KEY` from the model reference; the generated default is `openrouter/deepseek/deepseek-v4.1-flash`. Do not add Vercel AI SDK, Next.js, another provider URL, or a second model adapter without approval.
+
+Generated apps are headless. They have no browser UI and no password login; a bearer token authorizes machine clients, and Redis stores conversation history rather than login sessions.
 
 Users own their Railway/Cloud Run account, model key, and Redis. Local creation needs no GitHub or model call. Local development needs no Redis.
 
@@ -26,8 +28,9 @@ Keep commands thin and separate configuration, scaffolding, runtime, deployment,
 - Delete only remotely verified app-owned resources, with explicit confirmation.
 - Never print or store secrets in code, arguments, state, logs, uploads, images, or browser assets.
 - Keep `.env.example` placeholder-only. Builds must work without credentials.
-- Keep password protection, exact Origin/CSRF checks, bounded requests, and secure production cookies.
-- Production sessions require TLS Redis and must fail closed on outages. Memory is local development only.
+- Keep bearer-token authentication: exactly one `Authorization: Bearer` field, no query or cookie credentials, exact `Origin` when a client sends one, and bounded requests. Existing `deployment.access: protected` apps stay deployable and protected; never rewrite one into a token app.
+- Production stores conversation history in TLS Redis and must fail closed on outages. Memory history is local development only, and Redis is not a login-session store.
+- Never hardcode model prices; `models` reports live catalog estimates with a fetch timestamp. Never claim success for an empty or reasoning-only completion, and never let reasoning content reach replies or stored history.
 - Health and dashboard polling must never call a model.
 
 Do not deploy, run paid models, publish, or perform destructive operations without the user's permission. Do not call mocked provider tests a live deployment.

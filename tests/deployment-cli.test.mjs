@@ -13,15 +13,15 @@ import { loadExplicitSecrets } from '../dist/deployment/secrets.js';
 import { temporaryDirectory } from './helpers.mjs';
 
 const cliPath = fileURLToPath(new URL('../dist/cli.js', import.meta.url));
-const secrets = { FASTAGENT_PASSWORD_HASH: `scrypt-v1$${'a'.repeat(32)}$${'b'.repeat(128)}`,
-  OPENAI_API_KEY: 'synthetic-model-secret-123456', REDIS_URL: 'rediss://testuser:synthetic-redis-secret@redis.invalid/0' };
+const secrets = { FASTAGENT_API_TOKEN: 'a'.repeat(43),
+  OPENROUTER_API_KEY: 'synthetic-model-secret-123456', REDIS_URL: 'rediss://testuser:synthetic-redis-secret@redis.invalid/0' };
 const token = 'synthetic-account-token-123456';
 const code = (expected) => (error) => { assert.equal(error.code, expected); return true; };
 async function fixture(t) {
   const root = await temporaryDirectory(t), cwd = join(root, 'agent');
   await initProject({ directory: cwd });
-  await writeFile(join(cwd, '.env'), `OPENAI_API_KEY=${secrets.OPENAI_API_KEY}\nREDIS_URL=${secrets.REDIS_URL}\n`);
-  await writeFile(join(cwd, '.env.auth'), `FASTAGENT_PASSWORD_HASH='${secrets.FASTAGENT_PASSWORD_HASH}'\n`);
+  await writeFile(join(cwd, '.env'), `OPENROUTER_API_KEY=${secrets.OPENROUTER_API_KEY}\nREDIS_URL=${secrets.REDIS_URL}\n`);
+  await writeFile(join(cwd, '.env.auth'), `FASTAGENT_API_TOKEN=${secrets.FASTAGENT_API_TOKEN}\n`);
   await writeFile(join(cwd, '.env.railway'), `RAILWAY_API_TOKEN=${token}\n`);
   const store = new DeploymentStore(join(root, 'state'));
   const options = { command: 'deploy', provider: 'railway', workspace: 'workspace-test', cwd,
@@ -33,7 +33,7 @@ function provider(overrides = {}) {
   return { name: 'railway', preflight: async () => { throw new Error('service must not duplicate adapter preflight'); },
     deploy: async (input) => {
       const record = await input.state.read();
-      assert.ok(record.revision > 0); assert.equal(record.sessionNamespace, input.environment.FASTAGENT_SESSION_NAMESPACE);
+      assert.ok(record.revision > 0); assert.equal(record.sessionNamespace, input.environment.FASTAGENT_HISTORY_NAMESPACE);
       return input.state.write({ ...record, resources: [{ kind: 'service', id: 'service-test', ownership: 'owned' }],
         status: 'ready', phase: 'healthy', url: 'https://agent.example.invalid' });
     }, status: async () => ({ status: 'ready', url: 'https://agent.example.invalid' }),
@@ -50,6 +50,21 @@ function invoke(args, cwd, root, extra = {}) {
   assert.equal(result.error, undefined); assert.equal(result.signal, null);
   return result;
 }
+
+test('deployment service keeps an existing protected app on its password contract without rewriting it', async (t) => {
+  const f = await fixture(t);
+  const legacy = `schemaVersion: 1\nname: agent\nframework: openai\nmodel: openai/gpt-4o-mini\ndeployment:\n  access: protected\n`;
+  await writeFile(join(f.cwd, 'fastagent.yaml'), legacy);
+  const password = `scrypt-v1$${'a'.repeat(32)}$${'b'.repeat(128)}`;
+  await writeFile(join(f.cwd, '.env'), 'OPENAI_API_KEY=synthetic-openai-key\nREDIS_URL=rediss://testuser:synthetic-redis-secret@redis.invalid/0\n');
+  await writeFile(join(f.cwd, '.env.auth'), `FASTAGENT_PASSWORD_HASH='${password}'\n`);
+  const result = await executeDeployment({ ...f.options, dryRun: true }, f.deps);
+  assert.equal(result.dryRun, true);
+  assert.ok(result.secretKeys.includes('FASTAGENT_PASSWORD_HASH'));
+  assert.ok(result.secretKeys.includes('OPENAI_API_KEY'));
+  assert.ok(!result.secretKeys.includes('FASTAGENT_API_TOKEN'));
+  assert.equal(await readFile(join(f.cwd, 'fastagent.yaml'), 'utf8'), legacy);
+});
 
 test('deployment service dry run: real generated project, explicit secrets only, no provider calls/state record, cleanup', async (t) => {
   const f = await fixture(t);
@@ -69,7 +84,7 @@ test('deployment service deploy/update/status/logs/destroy: stable identity, red
   const f = await fixture(t); let stage;
   const adapter = provider({ deploy: async (input) => { stage = input.source.directory;
     await assert.rejects(readFile(join(stage, '.env')));
-    assert.deepEqual(input.environment.OPENAI_API_KEY, secrets.OPENAI_API_KEY);
+    assert.deepEqual(input.environment.OPENROUTER_API_KEY, secrets.OPENROUTER_API_KEY);
     return provider().deploy(input);
   }, destroy: async (input) => {
     assert.equal(input.record.status, 'destroying'); assert.equal(input.record.phase, 'destroy-pending');
@@ -99,7 +114,7 @@ test('deployment service deploy/update/status/logs/destroy: stable identity, red
 
 test('deployment explicit nonsecret origin/namespace remain useful in output while known secrets are redacted', async (t) => {
   const f = await fixture(t);
-  await writeFile(join(f.cwd, '.env.production'), 'APP_ORIGIN=https://agent.example.invalid\nFASTAGENT_SESSION_NAMESPACE=agent\n');
+  await writeFile(join(f.cwd, '.env.production'), 'APP_ORIGIN=https://agent.example.invalid\nFASTAGENT_HISTORY_NAMESPACE=agent\n');
   const result = await executeDeployment({ ...f.options, envFiles: [...f.options.envFiles, '.env.production'] }, { ...f.deps, provider: provider() });
   assert.equal(result.target, 'agent'); assert.equal(result.url, 'https://agent.example.invalid');
   assert.equal((await saved(f)).sessionNamespace, 'agent');
@@ -128,20 +143,20 @@ test('deployment cancellation preserves checkpoints and cleanup; namespaces and 
   } }) }), code('DEPLOYMENT_CANCELLED'));
   await assert.rejects(access(stage)); const initial = await saved(f); assert.equal(initial.status, 'pending');
   await assert.rejects(executeDeployment({ ...f.options, workspace: 'other-workspace' }, { ...f.deps, provider: provider() }), code('DEPLOYMENT_TARGET_MISMATCH'));
-  await writeFile(join(f.cwd, '.env.namespace'), 'FASTAGENT_SESSION_NAMESPACE=other-agent\n');
+  await writeFile(join(f.cwd, '.env.namespace'), 'FASTAGENT_HISTORY_NAMESPACE=other-agent\n');
   await assert.rejects(executeDeployment({ ...f.options, envFiles: [...f.options.envFiles, '.env.namespace'] }, { ...f.deps, provider: provider() }), code('DEPLOYMENT_NAMESPACE_MISMATCH'));
   assert.equal((await saved(f)).ownershipMarker, initial.ownershipMarker);
 });
 
 test('explicit env helper rejects unknown/local/malformed secrets, unsafe paths, duplicate keys and invalid hash/TLS Redis', async (t) => {
   const f = await fixture(t);
-  for (const source of ['UNKNOWN_SECRET=hidden-value', 'FASTAGENT_LOCAL_DEV=1', 'OPENAI_API_KEY="unterminated', 'not an assignment', 'OPENAI_API_KEY=one\nOPENAI_API_KEY=two']) {
+  for (const source of ['UNKNOWN_SECRET=hidden-value', 'FASTAGENT_LOCAL_DEV=1', 'OPENROUTER_API_KEY="unterminated', 'not an assignment', 'OPENROUTER_API_KEY=one\nOPENROUTER_API_KEY=two']) {
     await writeFile(join(f.cwd, '.env.bad'), source);
-    await assert.rejects(loadExplicitSecrets(['.env.bad'], f.cwd, ['OPENAI_API_KEY'], []), code('DEPLOYMENT_SECRET_FILE_INVALID'));
+    await assert.rejects(loadExplicitSecrets(['.env.bad'], f.cwd, ['OPENROUTER_API_KEY'], []), code('DEPLOYMENT_SECRET_FILE_INVALID'));
   }
   await assert.rejects(loadExplicitSecrets(['.env.example'], f.cwd, ['OPENAI_API_KEY'], []), code('DEPLOYMENT_SECRET_FILE_INVALID'));
   await assert.rejects(loadExplicitSecrets(['src/private.txt'], f.cwd, ['OPENAI_API_KEY'], []), code('DEPLOYMENT_SECRET_FILE_INVALID'));
-  for (const changed of [{ FASTAGENT_PASSWORD_HASH: 'invalid-hash' }, { OPENAI_API_KEY: 'bad key' }, { REDIS_URL: 'redis://redis.invalid' }]) {
+  for (const changed of [{ FASTAGENT_API_TOKEN: 'short' }, { OPENROUTER_API_KEY: 'bad key' }, { REDIS_URL: 'redis://redis.invalid' }]) {
     await writeFile(join(f.cwd, '.env.bad'), Object.entries({ ...secrets, ...changed }).map(([key, value]) => `${key}='${value}'`).join('\n'));
     await assert.rejects(executeDeployment({ ...f.options, envFiles: ['.env.bad'], dryRun: true }, f.deps), code('DEPLOYMENT_ENV_INVALID'));
   }

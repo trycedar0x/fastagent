@@ -5,10 +5,14 @@ import { createConfig, parseConfig, serializeConfig, validateConfig } from '../d
 const valid = () => createConfig('weather-agent');
 
 test('config: strict versioned YAML round-trip and configurable model metadata', () => {
-  const config = { ...valid(), model: 'another-provider/custom-model' };
+  const config = { ...valid(), model: 'openrouter/~deepseek/deepseek-flash-latest' };
   assert.deepEqual(parseConfig(serializeConfig(config)), config);
   assert.equal(config.schemaVersion, 1);
-  assert.equal(config.deployment.access, 'protected');
+  assert.equal(config.deployment.access, 'token');
+  assert.equal(valid().model, 'openrouter/deepseek/deepseek-v4.1-flash');
+  const legacy = { schemaVersion: 1, name: 'weather-agent', framework: 'openai', model: 'openai/gpt-4o-mini', deployment: { access: 'protected' } };
+  assert.deepEqual(parseConfig(serializeConfig(legacy)), legacy);
+  assert.equal(parseConfig(serializeConfig(legacy)).deployment.access, 'protected');
 });
 
 test('config: rejects unsupported versions, frameworks, names, models and secret fields', () => {
@@ -24,9 +28,11 @@ test('config: rejects unsupported versions, frameworks, names, models and secret
     { ...valid(), model: '' },
     { ...valid(), model: '   ' },
     { ...valid(), model: 'a'.repeat(201) },
+    { ...valid(), model: 'openrouter/https://evil.example/model' },
+    { ...valid(), deployment: { access: 'token', note: 'rewrite' } },
     { ...valid(), model: 'model\0secret' },
     { ...valid(), deployment: { access: 'public' } },
-    { ...valid(), deployment: { access: 'protected', token: 'test-only-secret' } },
+    { schemaVersion: 1, name: 'weather-agent', framework: 'openai', model: 'openai/gpt-4o-mini', deployment: { access: 'protected', token: 'test-only-secret' } },
     { ...valid(), apiKey: 'test-only-secret' },
   ];
   for (const value of invalid) {

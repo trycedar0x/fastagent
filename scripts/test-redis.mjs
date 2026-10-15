@@ -49,7 +49,7 @@ try {
   }
   if (!ready) throw new Error('Isolated local Redis failed to become ready.');
   run('npm', ['run', 'build']);
-  const tests = spawnSync(process.execPath, ['--test', 'tests/redis-session-store.integration.test.mjs'], {
+  const tests = spawnSync(process.execPath, ['--test', 'tests/redis-history-store.integration.test.mjs'], {
     stdio: 'inherit', env: { ...process.env, FASTAGENT_TEST_REDIS_PORT: String(port) }, timeout: 120000,
   });
   process.exitCode = tests.status ?? 1;
