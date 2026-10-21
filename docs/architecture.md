@@ -40,18 +40,20 @@ State writes are atomic and locked. Save confirmed IDs before the next cloud ope
 
 Resource names alone do not prove ownership. Adapters verify remote IDs and ownership markers before updating or deleting resources.
 
+`status`, `logs`, and `recover` read atomic record snapshots without taking mutation locks. New locks record a private random token, local host, owner PID, and creation time. Diagnostics classify an existing same-host PID as active, an absent owner PID as owner-exited, legacy/foreign/unverifiable locks as unknown, and no lock as unlocked. These observations are conservative: PID reuse can look active, and owner exit does not prove native child processes or cloud work ended. `recover` is an authenticated read-only diagnostic and next-step planner, not an automatic unlock/resume operation. It preserves all state and IDs, reports remote verification errors without payloads, and never changes phases, archives locks, steals ownership, or recreates resources.
+
 ## App runtime
 
 New apps are headless and serve these endpoints under one bearer token. A legacy `access: protected` app instead keeps the runtime it was generated with: it serves its browser login and scrypt-protected session endpoints, and its requests are authorized by a password hash and session cookies rather than a bearer token. The CLI derives the required secrets and the runtime namespace from `deployment.access`, so deploying an existing protected app keeps its password configuration, its `FASTAGENT_PASSWORD_HASH`, its `OPENAI_API_KEY`, and its `FASTAGENT_SESSION_NAMESPACE`, and never converts it to token access. The endpoint table below therefore describes a newly generated app:
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /healthz` | App and history-store readiness; no model call |
+| `GET /health` (alias `/healthz`) | App and history-store readiness; no model call |
 | `POST /api/chat` | Stream an authenticated, bounded chat response as NDJSON |
 | `GET /api/conversations/:id` | Return stored messages, or 404 |
 | `DELETE /api/conversations/:id` | Delete stored history, or 404; 409 while a generation lease is active |
 
-All three `/api/*` endpoints require `Authorization: Bearer <FASTAGENT_API_TOKEN>`; only `GET /healthz` is unauthenticated.
+All three `/api/*` endpoints require `Authorization: Bearer <FASTAGENT_API_TOKEN>`; only the health routes `GET /health` and `GET /healthz` are unauthenticated.
 
 Chat accepts one bounded user message and an optional server-issued conversation ID. The server owns conversation context; clients cannot supply roles, system prompts, a model, or history. Unknown supplied IDs return 404 before any model work.
 
@@ -118,9 +120,11 @@ Instance caps are cost defaults, not general singleton guarantees. Cloud Run set
 
 Deletion verifies the service and owned secrets. Projects, accounts, shared registries, images, and build history may remain.
 
+Preflight filters enabled services to the five required APIs; process-runner output exhaustion maps to the distinct secret-safe `CLOUDRUN_OUTPUT_LIMIT`, not a generic command failure. Updates stage with `--no-traffic`. Before promotion the adapter describes the exact recorded revision, verifies its service identity and protected configuration, and requires its own Ready condition; Ready/Retired with Active=False is allowed at this stage, without requiring the service's latestReadyRevisionName to advance. After promotion it separately waits for the service's observed generation and intended ready revision, verifies 100% untagged traffic, and probes public HTTPS `/health`. Container readiness alone is never deployment success.
+
 ## Health and dashboard
 
-Health and deployment status are separate. `check` requests bounded HTTPS `/healthz` without redirects or model calls. It does not test API keys or tools. `check --chat` is unsupported; `fastagent chat` is the explicit, billable chat test.
+Health and deployment status are separate. `check` requests bounded HTTPS `/health` for Cloud Run and `/healthz` for Railway, without redirects or model calls. Generated apps support both routes. Older Cloud Run apps must add `/health` returning the same store-readiness JSON and retain `/healthz` for compatibility; no fallback to a reserved path is attempted. Health does not test API keys or tools. `check --chat` is unsupported; `fastagent chat` is the explicit, billable chat test.
 
 The dashboard reads local records and polls health. Cloud status/log actions require explicit matching provider settings and authentication. Its default status is cached. JSON snapshots are offline.
 

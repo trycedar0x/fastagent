@@ -4,6 +4,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createCloudRunProvider } from '../dist/deployment/providers/cloudrun.js';
 import { createDeploymentRecord, deploymentKey, validateDeploymentRecord, DeploymentStore } from '../dist/deployment/state.js';
+import { FastagentError } from '../dist/errors.js';
 import { runtimeSecretKeys } from '../dist/deployment/types.js';
 import { temporaryDirectory } from './helpers.mjs';
 
@@ -62,7 +63,7 @@ async function fixture(t, changes = {}, overrides = {}, runtimeEnv = environment
       current = structuredClone({ ...record, revision: record.revision + 1 }); checkpoints.push(structuredClone(current)); events.push({ checkpoint: structuredClone(current) });
       return structuredClone(current);
     }, remove: async () => {}, release: async () => {} };
-  const remote = { service: undefined, secrets: new Map(), uploads: 0, public: false, trafficUpdates: 0, healthCalls: 0, ...changes };
+  const remote = { service: undefined, secrets: new Map(), uploads: 0, public: false, trafficUpdates: 0, healthCalls: 0, revisions: new Map(), ...changes };
   const value = (a, flag) => a[a.indexOf(flag) + 1];
   const canonical = (id) => id.replace(`projects/${project}/`, `projects/${number}/`);
   const runner = async (request) => {
@@ -81,7 +82,11 @@ async function fixture(t, changes = {}, overrides = {}, runtimeEnv = environment
     else if (a[0] === 'auth') output = remote.accounts ?? [{ account: 'fixture@example.invalid', status: 'ACTIVE' }];
     else if (a[0] === 'projects' && a[1] === 'describe') output = { projectId: project, projectNumber: number, lifecycleState: remote.lifecycle ?? 'ACTIVE' };
     else if (a[0] === 'billing') output = { name: `projects/${project}/billingInfo`, billingAccountName: 'billingAccounts/000000-111111-222222', billingEnabled: remote.billing ?? true };
-    else if (a[0] === 'services') output = (remote.apis ?? ['run', 'cloudbuild', 'artifactregistry', 'secretmanager', 'iam']).map((name) => ({ name: `projects/${number}/services/${name}.googleapis.com`, config: { name: `${name}.googleapis.com` }, state: 'ENABLED' }));
+    else if (a[0] === 'services') {
+      assert.equal(value(a, '--filter'), 'config.name:(run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com secretmanager.googleapis.com iam.googleapis.com)');
+      if (remote.processOutputLimit) throw new FastagentError('PROCESS_OUTPUT_LIMIT', 'synthetic-sensitive-output');
+      output = (remote.apis ?? ['run', 'cloudbuild', 'artifactregistry', 'secretmanager', 'iam']).map((name) => ({ name: `projects/${number}/services/${name}.googleapis.com`, config: { name: `${name}.googleapis.com` }, state: 'ENABLED' }));
+    }
     else if (a[0] === 'iam') output = { name: `projects/${project}/serviceAccounts/${a[3]}`, email: a[3], uniqueId: '123456789012345678901', disabled: remote.disabledSA ?? false };
     else if (a[0] === 'projects' && a[1] === 'get-iam-policy') {
       if (remote.policyDenied) throw new Error('permission denied');
@@ -124,6 +129,7 @@ async function fixture(t, changes = {}, overrides = {}, runtimeEnv = environment
       assert.equal(value(a, '--build-service-account'), `projects/${project}/serviceAccounts/${build}`);
       if (!remote.service || a.includes('--no-allow-unauthenticated')) { assert.ok(a.includes('--no-allow-unauthenticated')); remote.public = false; }
       else assert.ok(a.includes('--no-traffic'));
+      const previousReady = remote.service?.status.latestReadyRevisionName;
       const revision = `agent-0000${remote.uploads}-abc`, generation = remote.uploads;
       const env = value(a, '--set-env-vars').split(',').map((v) => { const index = v.indexOf('='); return { name: v.slice(0, index), value: v.slice(index + 1) }; });
       env.push(...value(a, '--set-secrets').split(',').map((v) => { const [name, ref] = v.split('='); const [secret, version] = ref.split(':'); return { name, valueFrom: { secretKeyRef: { name: secret, key: version } } }; }));
@@ -132,24 +138,41 @@ async function fixture(t, changes = {}, overrides = {}, runtimeEnv = environment
         spec: { template: { metadata: { annotations: { 'autoscaling.knative.dev/maxScale': '1' } }, spec: { serviceAccountName: runtime,
           containerConcurrency: 20, timeoutSeconds: 300, containers: [{ image: 'us-central1-docker.pkg.dev/fixture-project/cloud-run-source-deploy/agent@sha256:fixture', ports: [{ containerPort: 8080 }], env }] } } },
         status: { observedGeneration: remote.unobserved ? generation - 1 : generation, conditions: [{ type: 'Ready', status: remote.ready ?? 'True' }],
-          latestCreatedRevisionName: revision, latestReadyRevisionName: remote.wrongRevision ? 'agent-unrelated' : revision,
+          latestCreatedRevisionName: revision, latestReadyRevisionName: remote.wrongRevision ? 'agent-unrelated' : remote.stagedRetired && previousReady ? previousReady : revision,
           url: remote.url ?? origin, traffic: remote.service?.status.traffic ?? [{ revisionName: revision, percent: 100 }] } };
       if (remote.localDev) remote.service.spec.template.spec.containers[0].env.push({ name: 'FASTAGENT_LOCAL_DEV', value: '1' });
       if (remote.literalSecret) remote.service.spec.template.spec.containers[0].env.find((e) => e.name === 'REDIS_URL').value = runtimeEnv.REDIS_URL;
       if (remote.unsafeCap) remote.service.metadata.annotations['run.googleapis.com/maxScale'] = '2';
       if (remote.originDrift) remote.service.spec.template.spec.containers[0].env.find((e) => e.name === 'APP_ORIGIN').value = 'https://wrong.invalid';
+      remote.revisions.set(revision, { kind: 'Revision', metadata: { name: revision, namespace: number, generation: 1,
+        labels: { 'serving.knative.dev/service': service }, annotations: structuredClone(remote.service.spec.template.metadata.annotations) },
+        spec: structuredClone(remote.service.spec.template.spec), status: { observedGeneration: 1,
+          conditions: [{ type: 'Ready', status: remote.revisionReady ?? remote.ready ?? 'True', reason: remote.stagedRetired ? 'Retired' : undefined }, { type: 'Active', status: remote.stagedRetired ? 'False' : 'True' }] } });
       output = remote.service;
       if (remote.uploadError) { if (remote.uploadAbsent) remote.service = undefined; throw new Error('uncertain deploy'); }
+    } else if (a[0] === 'run' && a[1] === 'revisions' && a[2] === 'describe') {
+      assert.equal(request.intent, 'read');
+      output = structuredClone(remote.revisions.get(a[3]));
+      if (remote.revisionWrongService) output.metadata.labels['serving.knative.dev/service'] = 'another-service';
+      if (remote.revisionConfigDrift) output.spec.containers[0].env.find(e => e.name === 'APP_ORIGIN').value = 'https://wrong.invalid';
     } else if (a[0] === 'run' && a[1] === 'services') {
       if (a[2] === 'list') output = remote.service ? [remote.service] : [];
       else if (a[2] === 'describe') {
+        if (remote.pendingReady) {
+          if (remote.servingLag-- <= 0) { remote.service.status.latestReadyRevisionName = remote.pendingReady; remote.pendingReady = undefined; }
+        }
         output = structuredClone(remote.service);
         if (remote.unrelatedRevision) output.status.latestCreatedRevisionName = output.status.latestReadyRevisionName = 'agent-unrelated';
       }
       else if (a[2] === 'update-traffic') {
         remote.trafficUpdates++; const revision = value(a, '--to-revisions').split('=')[0]; assert.ok(a.includes('--clear-tags'));
         assert.equal(remote.service.status.conditions[0].status, 'True');
-        remote.service.status.traffic = remote.traffic ?? [{ revisionName: revision, percent: 100 }]; output = remote.service;
+        remote.service.status.traffic = remote.traffic ?? [{ revisionName: revision, percent: 100 }];
+        if (!remote.wrongRevision) {
+          if (remote.servingLag > 0) remote.pendingReady = revision;
+          else remote.service.status.latestReadyRevisionName = revision;
+        }
+        output = remote.service;
       } else if (a[2] === 'add-iam-policy-binding') {
         assert.ok(a.includes('--member=allUsers')); assert.ok(a.includes('--role=roles/run.invoker'));
         if (remote.publicDenied) throw new Error('organization policy');
@@ -161,7 +184,7 @@ async function fixture(t, changes = {}, overrides = {}, runtimeEnv = environment
     return { stdout: JSON.stringify(output), stderr: '', exitCode: 0 };
   };
   const health = async (request) => {
-    remote.healthCalls++; assert.ok(remote.public); assert.equal(request.url, `${current.url}/healthz`); assert.equal(request.maxResponseBytes, 4096);
+    remote.healthCalls++; assert.ok(remote.public); assert.equal(request.url, `${current.url}/health`); assert.equal(request.maxResponseBytes, 4096);
     if (remote.healthHang) return new Promise(() => {});
     if (remote.healthCancel) remote.healthCancel.abort();
     return { status: 200, body: remote.healthBody ?? { ok: true } };
@@ -172,6 +195,48 @@ async function fixture(t, changes = {}, overrides = {}, runtimeEnv = environment
   return { provider: createCloudRunProvider(options), options, input, state, remote, requests, checkpoints, events, diagnostics, secretKeys, runtimeEnv,
     record: () => structuredClone(current), replace: async (record) => state.write(record), markDestroying: async () => state.write({ ...current, status: 'destroying', phase: 'destroy-pending' }) };
 }
+
+test('cloudrun staged retired revision is verified before promotion, then serving readiness and public health are verified', async t => {
+  const f = await fixture(t);
+  await f.provider.deploy(f.input);
+  f.remote.stagedRetired = true;
+  f.remote.servingLag = 2;
+  const start = f.requests.length;
+  const result = await f.provider.deploy(f.input);
+  assert.equal(result.status, 'ready');
+  const requests = f.requests.slice(start);
+  const staged = requests.findIndex(r => r.args[1] === 'revisions' && r.args[2] === 'describe');
+  const promote = requests.findIndex(r => r.args[2] === 'update-traffic' && r.intent === 'mutate');
+  assert.ok(staged >= 0 && promote > staged);
+  assert.equal(requests[staged].args[3], 'agent-00002-abc');
+  assert.deepEqual(f.remote.service.status.traffic, [{ revisionName: 'agent-00002-abc', percent: 100 }]);
+  assert.equal(f.remote.service.status.latestReadyRevisionName, 'agent-00002-abc');
+  assert.ok(f.remote.healthCalls >= 2);
+});
+
+test('cloudrun rejects a staged revision with wrong ownership identity, config or readiness before traffic promotion', async t => {
+  for (const [change, expected] of [
+    [{ revisionWrongService: true }, 'CLOUDRUN_REVISION_MISMATCH'],
+    [{ revisionConfigDrift: true }, 'CLOUDRUN_CONFIG_MISMATCH'],
+    [{ revisionReady: 'False' }, 'CLOUDRUN_NOT_READY'],
+    [{ revisionReady: 'Unknown' }, 'CLOUDRUN_DEPLOYMENT_TIMEOUT'],
+  ]) {
+    const f = await fixture(t, change, { deploymentTimeoutMs: 80 });
+    await assert.rejects(f.provider.deploy(f.input), code(expected));
+    assert.equal(f.remote.trafficUpdates, 0); assert.equal(f.remote.public, false);
+  }
+});
+
+test('cloudrun actual process output-limit errors keep a distinct safe code and APIs query is narrowed', async t => {
+  const f = await fixture(t, { processOutputLimit: true });
+  await assert.rejects(f.provider.preflight(f.input, environment()), error => {
+    assert.equal(error.code, 'CLOUDRUN_OUTPUT_LIMIT');
+    assert.ok(!error.message.includes('synthetic-sensitive-output'));
+    return true;
+  });
+  assert.ok(f.requests.every(r => r.intent === 'read'));
+  assert.ok(f.requests.find(r => r.args[0] === 'services').args.includes('--filter'));
+});
 
 test('cloudrun preflight: parsed gcloud capabilities, explicit identities, project billing APIs; no mutation', async (t) => {
   const f = await fixture(t); await f.provider.preflight(f.input, environment());

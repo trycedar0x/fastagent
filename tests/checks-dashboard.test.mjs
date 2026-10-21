@@ -116,6 +116,18 @@ test('checks/health: bounded no-redirect HTTPS GET ok:true, never model calls or
   assert.equal(requests[0].body, undefined);
 });
 
+test('checks/health: Cloud Run public health avoids reserved paths and tells legacy apps to add /health', async () => {
+  const record = synthetic(root, 'cloudrun');
+  const paths = [];
+  const result = await checkHealth(record, { http: createDeploymentHttp(async url => {
+    paths.push(new URL(url).pathname);
+    return new Response('{"ok":true}');
+  }) });
+  assert.equal(result.health, 'healthy'); assert.deepEqual(paths, ['/health']);
+  const legacy = await checkHealth(record, { http: createDeploymentHttp(async () => new Response('<html>404</html>', { status: 404 })) });
+  assert.equal(legacy.health, 'unhealthy'); assert.match(legacy.detail, /add it to older apps and redeploy/);
+});
+
 test('checks/health: per-row invalid JSON, status, redirects, oversize, protocol and thrown errors are sanitized', async () => {
   const record = synthetic();
   for (const response of [new Response('not JSON'), new Response('{"ok":false}'), new Response('[]'), new Response('{"ok":true}', { status: 503 }), new Response('', { status: 302 }), new Response('x'.repeat(4097))]) {
@@ -221,6 +233,17 @@ test('dashboard/TTY: explicit R status and L logs use shared authenticated actio
   tty.key('r'); await tick(); assert.equal(actions[0][1], 'status'); assert.match(tty.screen, /Explicit provider status/);
   tty.key('l'); await tick(); assert.equal(actions[1][1], 'logs'); assert.match(tty.screen, /safe log two/); assert.ok(!tty.screen.includes('\x1b[31m'));
   timers.fire(15_000); await tick(); assert.equal(actions.length, 2);
+  tty.key('q'); await pending;
+});
+
+test('dashboard/TTY: locked-target remote failures never present cached status as provider-verified', async () => {
+  const tty = terminal(), timers = clock(), record = synthetic();
+  const options = { provider: 'railway', workspace: 'workspace-one', authFile: '/synthetic/.env.railway' };
+  const pending = runDashboard(options, { ...tty, ...timers, snapshot: snapshotOf([record]), health: healthy,
+    action: async () => ({ status: 'ready', remoteStatusVerified: false, statusSource: 'cached' }) });
+  await tick(); tty.key('r'); await tick();
+  assert.match(tty.screen, /Provider status could not be verified/);
+  assert.ok(!tty.screen.includes('Explicit provider status for railway/agent: ready'));
   tty.key('q'); await pending;
 });
 

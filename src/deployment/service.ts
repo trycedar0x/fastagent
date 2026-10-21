@@ -10,11 +10,11 @@ import { createCloudRunProvider } from './providers/cloudrun.js';
 import { createRailwayProvider } from './providers/railway.js';
 import { detectRuntimeEnvFiles, loadExplicitSecrets } from './secrets.js';
 import { stageDeploymentSource, type StagedSource } from './staging.js';
-import { createDeploymentRecord, DeploymentStore, type DeploymentLock, type DeploymentRecord } from './state.js';
+import { canonicalDeploymentSelector, createDeploymentRecord, DeploymentStore, type DeploymentLock, type DeploymentRecord, type DeploymentLockInfo } from './state.js';
 import { validatePreflightEnvironment, type DeploymentProvider, type ProviderName } from './types.js';
 import type { RailwayHttpTransport } from './providers/railway.js';
 
-export type DeploymentCommand = 'login' | 'deploy' | 'status' | 'logs' | 'destroy';
+export type DeploymentCommand = 'login' | 'deploy' | 'status' | 'logs' | 'destroy' | 'recover';
 export interface DeploymentOptions {
   command: DeploymentCommand;
   provider: ProviderName;
@@ -61,7 +61,7 @@ export async function executeDeployment(options: DeploymentOptions, dependencies
   let lock: DeploymentLock | undefined, source: StagedSource | undefined;
   try {
     const { command, provider: name } = options;
-    if (!['login', 'deploy', 'status', 'logs', 'destroy'].includes(command) || !['railway', 'cloudrun'].includes(name) ||
+    if (!['login', 'deploy', 'status', 'logs', 'destroy', 'recover'].includes(command) || !['railway', 'cloudrun'].includes(name) ||
         (command !== 'deploy' && (options.envFiles !== undefined || options.dryRun !== undefined)) ||
         (command !== 'destroy' && options.yes !== undefined) || (command !== 'login' && options.interactive !== undefined) ||
         (name !== 'railway' && (options.workspace !== undefined || options.authFile !== undefined || options.railwayProject !== undefined || options.railwayEnvironment !== undefined)) ||
@@ -102,11 +102,16 @@ export async function executeDeployment(options: DeploymentOptions, dependencies
         { scope: 'project', token: auth.RAILWAY_TOKEN!, projectId: options.railwayProject!, environmentId: options.railwayEnvironment! },
       commandEnv: Object.fromEntries(Object.entries(commandEnv).filter(([key]) => ['PATH', 'HOME', 'TMPDIR'].includes(key))), http });
     if (adapter && adapter.name !== name) throw invalid();
-    lock = await (dependencies.store ?? new DeploymentStore()).acquire({ projectPath: cwd, provider: name, target });
-    let record = await lock.read();
+    const store = dependencies.store ?? new DeploymentStore();
+    const selector = await canonicalDeploymentSelector({ projectPath: cwd, provider: name, target });
+    const readOnly = command === 'status' || command === 'logs' || command === 'recover';
+    let operation: DeploymentLockInfo | undefined;
+    if (readOnly) operation = await store.inspectLock(selector);
+    else lock = await store.acquire(selector);
+    let record = readOnly ? await store.read(selector) : await lock!.read();
     const selectors = name === 'railway' ? { project: options.workspace! } : { project: options.project!, region: options.region! };
     if (record && JSON.stringify(record.selectors) !== JSON.stringify(selectors)) throw new FastagentError('DEPLOYMENT_TARGET_MISMATCH', 'Provider selectors differ from the recorded target; select the original target explicitly.');
-    const context = { selector: lock.selector, runner: dependencies.runner ?? createProcessRunner(), ...(options.signal ? { signal: options.signal } : {}) };
+    const context = { selector, runner: dependencies.runner ?? createProcessRunner(), ...(options.signal ? { signal: options.signal } : {}) };
     let result: Record<string, unknown>;
     if (command === 'deploy') {
       if (record?.status === 'destroying') throw new FastagentError('DEPLOYMENT_DESTROY_PENDING', 'Target destruction is pending; finish or inspect destruction before deploying.');
@@ -117,7 +122,7 @@ export async function executeDeployment(options: DeploymentOptions, dependencies
         'No runtime env files found. Create an ignored .env (model key plus either a TLS rediss:// REDIS_URL or FASTAGENT_EPHEMERAL_HISTORY=1) and .env.auth (FASTAGENT_API_TOKEN), or pass --env-file explicitly.');
       const environment = await loadExplicitSecrets(envFiles, cwd, runtimeKeysFor(config), sensitive);
       if (!record && auth.RAILWAY_TOKEN && !options.dryRun) throw new FastagentError('RAILWAY_ACCOUNT_REQUIRED', 'First deployment requires an account/workspace API token; project tokens require an existing recorded target.');
-      const initial = record ?? { ...createDeploymentRecord(lock.selector), selectors,
+      const initial = record ?? { ...createDeploymentRecord(lock!.selector), selectors,
         resources: name === 'cloudrun' ? [{ kind: 'project' as const, id: options.project!, ownership: 'external' as const }] : [] };
       const namespaceKey = config.deployment.access === 'token' ? 'FASTAGENT_HISTORY_NAMESPACE' : 'FASTAGENT_SESSION_NAMESPACE';
       const suppliedNamespace = environment[namespaceKey];
@@ -131,18 +136,52 @@ export async function executeDeployment(options: DeploymentOptions, dependencies
         plan: ['Validate explicit runtime secrets and filtered source (complete)', 'On deploy: verify native CLI, authorization, billing and prerequisites', 'Create/update recorded resources, inject secrets, upload source, verify HTTPS health'],
         notice: 'No provider operations performed. Deployment is billable; TLS Redis is user-owned. This plan does not certify cloud permissions or readiness.' };
       else {
-        if (!record) record = await lock.write(initial);
-        const deployed = await adapter!.deploy({ ...context, state: lock, source, environment: validated });
+        if (!record) record = await lock!.write(initial);
+        const deployed = await adapter!.deploy({ ...context, state: lock!, source, environment: validated });
         result = summary(command, deployed);
       }
     } else {
       if (!record) throw new FastagentError('DEPLOYMENT_NOT_FOUND', 'No recorded deployment for this directory, provider and target.');
-      if (command === 'status') result = { ...summary(command, record), ...(await adapter!.status(context, record)) };
+      if (command === 'status' || command === 'recover') {
+        let remote: Record<string, unknown>;
+        try { remote = { ...(await adapter!.status(context, record)), remoteStatusVerified: true }; }
+        catch (error) {
+          if (options.signal?.aborted) throw error;
+          if (command !== 'recover' && operation?.state === 'unlocked') throw error;
+          remote = { remoteStatusVerified: false, remoteErrorCode: error instanceof FastagentError ? error.code : 'DEPLOYMENT_FAILED',
+            notice: 'Remote status could not be verified; the checkpoint below is cached, not proof of readiness or ownership.' };
+        }
+        result = { ...summary(command, record), ...remote, statusSource: remote.remoteStatusVerified ? 'provider' : 'cached', operation, checkpoint: { status: record.status, phase: record.phase, revision: record.revision, updatedAt: record.updatedAt } };
+        if (command === 'recover') {
+          result.readOnly = true;
+          result.stateDirectory = store.directory;
+          result.resources = record.resources;
+          result.resumeBlocked = operation?.state !== 'unlocked' || !remote.remoteStatusVerified || remote.status === 'missing' || record.status === 'destroying';
+          result.resumeRequiresConfirmation = true;
+          const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+          const flags = name === 'cloudrun' ? ['--project', options.project!, '--region', options.region!, '--runtime-account', options.runtimeAccount!, '--build-account', options.buildAccount!]
+            : ['--workspace', options.workspace!, '--auth-file', options.authFile!, ...(options.railwayProject ? ['--railway-project', options.railwayProject, '--railway-environment', options.railwayEnvironment!] : [])];
+          const resumeCommand = ['fastagent', 'deploy', '--provider', name, '--target', target, ...flags].map(quote).join(' ');
+          if (record.status !== 'destroying') result.resumeCommand = resumeCommand;
+          result.nextSteps = [
+            operation?.state === 'active' ? 'The recorded local CLI PID is running. Do not archive the lock or start another mutation; wait for or stop the original operation explicitly.'
+              : operation?.state === 'owner-exited' ? 'The local CLI PID exited, but a gcloud child, Cloud Build, or cloud operation may still be running. Confirm those have completed before touching the lock.'
+                : operation?.state === 'unknown' ? 'The lock is legacy, foreign-host, or cannot be tied to a live process. Establish that ALL local and remote operations have stopped; age alone is not evidence.'
+                  : 'No local mutation lock was observed. Remote operations may still be running; inspect them before resuming.',
+            'Preserve the checkpoint and every resource ID. Back up the private deployment state directory before manual intervention; never reset the phase, delete resources, or invent a revision ID.',
+            ...(operation?.state !== 'unlocked' ? [`Only after independently confirming no operation is active, archive the exact ${record.key}.lock file in ${store.directory}; do not delete the ${record.key}.json record. Rerun recover before resuming.`] : []),
+            remote.status === 'missing' ? 'The recorded service is missing. Do not resume or recreate it automatically; reconcile the recorded IDs with the cloud account manually.'
+              : remote.remoteStatusVerified ? 'Provider status was verified for this snapshot, not permission to recreate resources. Deploy will reconcile recorded ownership and revision identity again before mutations.'
+              : 'Remote verification failed. Resolve the reported remoteErrorCode and rerun recover; do not resume an unverified target.',
+            `From the recorded app directory, after resolving the conditions above, run: ${record.status === 'destroying' ? 'finish the explicitly confirmed destroy command with the original provider flags; do not redeploy a destroying target.' : resumeCommand}. Deploy reads the existing runtime env files; use the same explicit --env-file paths if they are nonstandard.`,
+          ];
+        }
+      }
       else if (command === 'logs') result = { command, provider: name, target, logs: await adapter!.logs(context, record) };
       else {
-        record = await lock.write({ ...record, status: 'destroying', phase: 'destroy-pending' });
+        record = await lock!.write({ ...record, status: 'destroying', phase: 'destroy-pending' });
         const proof = await adapter!.destroy({ ...context, record, confirmed: true });
-        await lock.remove(proof);
+        await lock!.remove(proof);
         result = { command, provider: name, target, destroyed: true, notice: 'Only verified app-owned resources removed; shared projects, accounts and build artifacts may remain billable.' };
       }
     }
@@ -168,6 +207,7 @@ function summary(command: string, record: DeploymentRecord): Record<string, unkn
 export function formatDeploymentResult(result: Record<string, unknown>): string {
   if (typeof result.instructions === 'string') return `${result.instructions}\n`;
   if (typeof result.logs === 'string') return result.logs + '\n';
+  if (Array.isArray(result.nextSteps)) return `${result.provider}/${result.target}: recovery inspection (read-only)\nLock: ${(result.operation as DeploymentLockInfo).state}\n${result.notice ? `${result.notice}\n` : ''}${result.nextSteps.join('\n')}\n`;
   if (result.dryRun) return `Dry run: ${result.provider}/${result.target}\n${(result.files as string[]).length} staged files (${result.bytes} bytes); staging removed after validation.\n${(result.plan as string[]).join('\n')}\n${result.notice}\n`;
-  return `${result.provider}/${result.target}: ${result.destroyed ? 'destroyed' : result.status}${result.url ? `\n${result.url}` : ''}${result.notice ? `\n${result.notice}` : ''}\n`;
+  return `${result.provider}/${result.target}: ${result.destroyed ? 'destroyed' : result.status}${result.url ? `\n${result.url}` : ''}${result.operation ? `\nOperation lock: ${(result.operation as DeploymentLockInfo).state}; checkpoint is a read-only snapshot.` : ''}${result.remoteErrorCode ? `\nRemote verification: ${result.remoteErrorCode}` : ''}${result.notice ? `\n${result.notice}` : ''}\n`;
 }

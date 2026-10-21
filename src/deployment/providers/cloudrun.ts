@@ -8,6 +8,7 @@ import { isTokenRuntime, redisNamespace, redisNamespaceVariable, runtimeSecretKe
 const knownSecretKeys = ['FASTAGENT_PASSWORD_HASH', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'FASTAGENT_API_TOKEN', 'REDIS_URL'] as const;
 const ownerLabel = 'fastagent-owner';
 const fail = (code: string) => new FastagentError(code,
+  code === 'CLOUDRUN_OUTPUT_LIMIT' ? 'Cloud Run command or health output exceeded its bounded response limit. No raw output is shown; inspect the query scope and recorded checkpoint before retrying. Do not raise the limit or repeat uncertain mutations blindly.' :
   'Cloud Run operation could not be verified. Check gcloud permissions/prerequisites and the recorded resource IDs before retrying; uncertain mutations are not automatically recreated.');
 const obj = (value: unknown): Record<string, unknown> => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw fail('CLOUDRUN_SCHEMA_UNSUPPORTED');
@@ -21,7 +22,7 @@ const parse = (text: string): unknown => { try { return JSON.parse(text); } catc
 const text = (value: unknown): string => { if (typeof value !== 'string') throw fail('CLOUDRUN_SCHEMA_UNSUPPORTED'); return value; };
 
 /** Transport must refuse redirects and bound bytes while receiving; never log responses.
- * Only GET /healthz is used. It must not call a model or load credentials. */
+ * Only GET /health is used (Cloud Run reserves some paths ending in z). It must not call a model or load credentials. */
 export type CloudRunHealthTransport = (request: {
   url: string; signal: AbortSignal; maxResponseBytes: number;
 }) => Promise<{ status: number; body: unknown }>;
@@ -121,6 +122,7 @@ export function createCloudRunProvider(options: CloudRunOptions): DeploymentProv
       cancelled(context.signal);
       return output;
     } catch (error) {
+      if (error instanceof FastagentError && error.code === 'PROCESS_OUTPUT_LIMIT') throw fail('CLOUDRUN_OUTPUT_LIMIT');
       if (error instanceof FastagentError && ['CLOUDRUN_CANCELLED', 'CLOUDRUN_TIMEOUT', 'CLOUDRUN_OUTPUT_LIMIT'].includes(error.code)) throw fail(error.code);
       throw fail(context.signal?.aborted ? 'CLOUDRUN_CANCELLED' : 'CLOUDRUN_COMMAND_FAILED');
     }
@@ -183,7 +185,8 @@ export function createCloudRunProvider(options: CloudRunOptions): DeploymentProv
     const number = projectNumber!;
     const billing = obj(parse(await command(context, ['billing', 'projects', 'describe', options.project, '--format=json'])));
     if (billing.billingEnabled !== true) throw fail('CLOUDRUN_BILLING_REQUIRED');
-    const enabled = list(parse(await command(context, ['services', 'list', '--enabled', '--format=json']))).map((entry) => text(obj(obj(entry).config).name));
+    const requiredApis = ['run', 'cloudbuild', 'artifactregistry', 'secretmanager', 'iam'].map(name => `${name}.googleapis.com`);
+    const enabled = list(parse(await command(context, ['services', 'list', '--enabled', '--filter', `config.name:(${requiredApis.join(' ')})`, '--format=json']))).map((entry) => text(obj(obj(entry).config).name));
     if (['run.googleapis.com', 'cloudbuild.googleapis.com', 'artifactregistry.googleapis.com', 'secretmanager.googleapis.com', 'iam.googleapis.com'].some((api) => !enabled.includes(api))) throw fail('CLOUDRUN_APIS_REQUIRED');
     for (const email of [options.runtimeServiceAccount, options.buildServiceAccount]) {
       const identity = obj(parse(await command(context, ['iam', 'service-accounts', 'describe', email, '--format=json'])));
@@ -281,6 +284,21 @@ export function createCloudRunProvider(options: CloudRunOptions): DeploymentProv
     if (condition?.status === 'False') throw fail('CLOUDRUN_NOT_READY');
     return condition?.status === 'True' && status.latestReadyRevisionName === revision && status.latestCreatedRevisionName === revision;
   }
+  // A --no-traffic revision can be Ready/Retired without becoming the service's latestReadyRevision.
+  // Verify the exact immutable revision and its protected configuration, not serving state, here.
+  async function stagedReady(context: ProviderContext, remote: Record<string, unknown>, record: DeploymentRecord, revision: string) {
+    const selected = obj(parse(await command(context, ['run', 'revisions', 'describe', revision, '--region', options.region, '--format=json'])));
+    const metadata = obj(selected.metadata), status = obj(selected.status);
+    if (selected.kind !== 'Revision' || metadata.name !== revision || String(metadata.namespace) !== String(projectNumber) ||
+        obj(metadata.labels)['serving.knative.dev/service'] !== options.service) throw fail('CLOUDRUN_REVISION_MISMATCH');
+    // Verify the revision's own spec, not just the service's latest template. The service ownership
+    // was verified separately; the revision must belong to that service and use the exact config.
+    config({ ...remote, spec: { template: { metadata, spec: selected.spec } } }, record);
+    if (status.observedGeneration !== undefined && String(status.observedGeneration) !== String(metadata.generation)) return false;
+    const condition = list(status.conditions).map(obj).find(c => c.type === 'Ready');
+    if (condition?.status === 'False') throw fail('CLOUDRUN_NOT_READY');
+    return condition?.status === 'True';
+  }
   function traffic(remote: Record<string, unknown>, revision: string) {
     const targets = list(obj(remote.status).traffic).map(obj);
     if (targets.length !== 1 || targets[0]!.percent !== 100 || targets[0]!.revisionName !== revision || targets[0]!.tag !== undefined || targets[0]!.url !== undefined) throw fail('CLOUDRUN_TRAFFIC_UNSAFE');
@@ -300,7 +318,7 @@ export function createCloudRunProvider(options: CloudRunOptions): DeploymentProv
   }
   async function healthy(context: ProviderContext, record: DeploymentRecord) {
     try {
-      const result = await bounded((signal) => options.health({ url: `${validateHttpsOrigin(record.url!)}/healthz`, signal, maxResponseBytes: 4096 }), context.signal);
+      const result = await bounded((signal) => options.health({ url: `${validateHttpsOrigin(record.url!)}/health`, signal, maxResponseBytes: 4096 }), context.signal);
       if (Buffer.byteLength(JSON.stringify(result.body) ?? '') > 4096) throw fail('CLOUDRUN_OUTPUT_LIMIT');
       return result.status === 200 && obj(result.body).ok === true;
     } catch (error) {
@@ -454,13 +472,18 @@ export function createCloudRunProvider(options: CloudRunOptions): DeploymentProv
       if (!remote) throw fail('CLOUDRUN_TARGET_MISSING');
       config(remote, record);
       if (obj(remote.status).latestCreatedRevisionName !== revision) throw fail('CLOUDRUN_REVISION_MISMATCH');
-      if (ready(remote, revision)) break;
+      if (await stagedReady(input, remote, record, revision)) break;
       await wait(input.signal);
     }
     await command(input, run(['update-traffic', options.service, '--to-revisions', `${revision}=100`, '--clear-tags', '--quiet', '--format=json']), 'mutate');
-    remote = await service(input);
-    if (!remote) throw fail('CLOUDRUN_TARGET_MISSING');
-    config(remote, record); if (!ready(remote, revision)) throw fail('CLOUDRUN_NOT_READY'); traffic(remote, revision);
+    while (remaining()) {
+      remote = await service(input);
+      if (!remote) throw fail('CLOUDRUN_TARGET_MISSING');
+      config(remote, record);
+      if (obj(remote.status).latestCreatedRevisionName !== revision) throw fail('CLOUDRUN_REVISION_MISMATCH');
+      if (ready(remote, revision)) { traffic(remote, revision); break; }
+      await wait(input.signal);
+    }
     // Public IAM is granted only after protected config, origin, readiness and traffic verification.
     // Policy denial leaves a recoverable source-uploaded checkpoint, not a ready deployment.
     await command(input, run(['add-iam-policy-binding', options.service, '--member=allUsers', '--role=roles/run.invoker', '--quiet', '--format=json']), 'mutate');
@@ -486,6 +509,7 @@ export function createCloudRunProvider(options: CloudRunOptions): DeploymentProv
       const revision = record.resources.find((r) => r.kind === 'revision')?.id;
       if (!revision) return { status: 'pending' };
       config(remote, record);
+      if (obj(remote.status).latestCreatedRevisionName !== revision) throw fail('CLOUDRUN_REVISION_MISMATCH');
       try { if (!ready(remote, revision)) return { status: 'deploying', url: record.url! }; }
       catch (error) { if (error instanceof FastagentError && error.code === 'CLOUDRUN_NOT_READY') return { status: 'failed', url: record.url! }; throw error; }
       traffic(remote, revision);

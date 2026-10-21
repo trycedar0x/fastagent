@@ -92,7 +92,7 @@ Run lifecycle commands inside the app directory. `--target` defaults to the conf
 
 For production, `.env` supplies the model key selected by `fastagent.yaml` (`OPENROUTER_API_KEY` or `OPENAI_API_KEY`) and exactly one history backend: TLS `REDIS_URL`, or `FASTAGENT_EPHEMERAL_HISTORY=1` for single-instance in-memory history. `.env.auth` supplies `FASTAGENT_API_TOKEN`. When `--env-file` is omitted, deploy auto-detects the ignored `.env` then `.env.auth` in the app directory (never `.env.example`, never the shell); explicit `--env-file` flags still win. Local secret files must be root `.env` or `.env.*`, not `.env.example`; omit empty assignments. Do not set both model keys.
 
-Ephemeral mode is an explicit opt-in accepted only as the literal `1`. It is safe only when the deployment pins one instance: Cloud Run is capped at one instance and Railway is pinned to one replica. Both or neither backend fails closed with a distinct code. History lives in memory and is lost on restart; `GET /healthz` still works. Never enable it without the single-instance pin.
+Ephemeral mode is an explicit opt-in accepted only as the literal `1`. It is safe only when the deployment pins one instance: Cloud Run is capped at one instance and Railway is pinned to one replica. Both or neither backend fails closed with a distinct code. History lives in memory and is lost on restart; `GET /health` still works. Never enable it without the single-instance pin.
 
 Leave `APP_ORIGIN` unset on first deployment. The CLI sets the exact provider origin. A supplied update origin must match the recorded URL. Preserve the recorded history namespace.
 
@@ -129,7 +129,7 @@ Interactive login needs a terminal and cannot use `--json`. Fastagent does not c
 
 ## Inspect and delete
 
-`status`, `logs`, and `destroy` use the same provider settings/authentication, without runtime env files.
+`status`, `logs`, `recover`, and `destroy` use the same provider settings/authentication, without runtime env files. `status`, `logs`, and `recover` are read-only and do not acquire mutation locks. `recover --provider ... --json` returns recorded IDs, checkpoint, lock-owner diagnostics, remote verification outcome, and manual next steps; it never unlocks, mutates cloud resources, or resets state. New locks include host/PID/time metadata; legacy/foreign locks are unknown. Never infer that cloud operations stopped from a CLI timeout or dead PID. Back up state, independently verify all native/cloud work stopped, then manually archive only the identified lock if appropriate. Preserve record IDs and rerun recover before retrying the same target. `remoteStatusVerified: false` blocks any assumption of readiness; resolve its code first. `CLOUDRUN_OUTPUT_LIMIT` preserves output-overflow diagnosis without payloads.
 
 Deletion requires user permission, `--yes`, and verified ownership. Shared projects, images, and build history may remain billable. Cloud Run logs withhold application payloads.
 
@@ -137,7 +137,7 @@ Do not blindly retry uncertain mutations or delete resources based only on their
 
 ## Health and chat
 
-`check` reads the current app's saved target and requests HTTPS `/healthz` only. Choose `--provider` if both providers are recorded. Health does not certify model keys or tools; it never calls a model.
+`check` reads the current app's saved target and requests HTTPS `/health` for Cloud Run or `/healthz` for Railway. Generated apps serve both. Older Cloud Run apps must add the no-model `/health` history-store readiness endpoint, retain `/healthz` as an alias, and redeploy. Cloud Run reserves some z-suffixed paths; do not retry a reserved path or treat container startup as public health success. Choose `--provider` if both providers are recorded. Health does not certify model keys or tools and never calls a model.
 
 `check --chat` is unsupported and exits before secret/network access. To test chat, use `fastagent chat`, which sends one real, billable request with an explicit `--message <text>` or `--stdin` (`--message -`) and can resume a conversation with `--conversation`. It never reads stdin implicitly.
 

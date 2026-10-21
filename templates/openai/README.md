@@ -94,6 +94,8 @@ Redis is optional only through the explicit `FASTAGENT_EPHEMERAL_HISTORY=1` opt-
 
 The Dockerfile runs as a non-root user and copies only known app inputs. Keep env files and credentials out of source and images. Upload filtering cannot detect every secret embedded in code. Fastagent deployment currently expects its bundled Dockerfile.
 
+Cloud Run public health checks use `/health` because some paths ending in `z` are reserved by the platform. This app serves `/health` and the compatibility alias `/healthz` with the same no-model history-store readiness check. If upgrading older app source, add `/health` explicitly before deploying; updating the CLI does not rewrite app files. Container startup alone does not prove the public endpoint works.
+
 ## Bearer token and history
 
 One token authorizes all conversations for this app. There is no user identity, cookie, or CSRF login. If a browser sends `Origin`, it must match `APP_ORIGIN` exactly. Machine clients may omit `Origin`.
@@ -108,12 +110,12 @@ Changing the token does not delete stored history. Use a different history names
 
 | Endpoint | Behavior |
 | --- | --- |
-| `GET /healthz` | `200 {"ok":true}` when ready; 503 during history-store outages; no model call |
+| `GET /health` (alias `/healthz`) | `200 {"ok":true}` when ready; 503 during history-store outages; no model call |
 | `POST /api/chat` | Bearer token plus `{"message":"...","conversationId?":"..."}`; streams NDJSON |
 | `GET /api/conversations/:id` | Bearer token; returns stored messages, or 404 |
 | `DELETE /api/conversations/:id` | Bearer token; deletes stored history, or 404; 409 if a generation lease is active |
 
-Every `/api/*` endpoint requires `Authorization: Bearer <FASTAGENT_API_TOKEN>`, including reading and deleting stored history; `GET /healthz` is the only unauthenticated endpoint. Query tokens, cookies, and duplicate authorization fields are rejected. Unknown supplied conversation IDs return 404 before model work. The server assigns new IDs.
+Every `/api/*` endpoint requires `Authorization: Bearer <FASTAGENT_API_TOKEN>`, including reading and deleting stored history; the health routes `GET /health` and `GET /healthz` are unauthenticated. Query tokens, cookies, and duplicate authorization fields are rejected. Unknown supplied conversation IDs return 404 before model work. The server assigns new IDs.
 
 Chat uses UTF-8 `application/x-ndjson`: one JSON object per line.
 

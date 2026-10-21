@@ -126,7 +126,7 @@ Use a `rediss://` Redis URL, or `FASTAGENT_EPHEMERAL_HISTORY=1` for single-insta
 
 You no longer have to retype the paths: when `--env-file` is omitted, deploy auto-detects the ignored `.env` and then `.env.auth` in the app directory. It never reads `.env.example`, never recurses, and never reads the shell; an explicit `--env-file` still wins. The CLI does not inherit runtime secrets or Railway tokens from your shell.
 
-`FASTAGENT_EPHEMERAL_HISTORY=1` keeps history in memory. Enable it only when the deployment pins exactly one instance: Fastagent deploys Cloud Run with `--max-instances=1` (each revision at most one instance) and pins Railway to one replica. Treat this as disposable history: a Cloud Run rollout can briefly overlap the old and new revisions, so two processes may each hold separate memory for that window. The app refuses to start if both Redis and ephemeral mode are set, and in production if neither is set. It prints a startup warning and history is lost on every restart; machine clients are unaffected and `GET /healthz` still works.
+`FASTAGENT_EPHEMERAL_HISTORY=1` keeps history in memory. Enable it only when the deployment pins exactly one instance: Fastagent deploys Cloud Run with `--max-instances=1` (each revision at most one instance) and pins Railway to one replica. Treat this as disposable history: a Cloud Run rollout can briefly overlap the old and new revisions, so two processes may each hold separate memory for that window. The app refuses to start if both Redis and ephemeral mode are set, and in production if neither is set. It prints a startup warning and history is lost on every restart; machine clients are unaffected and `GET /health` still works.
 
 Leave `APP_ORIGIN` unset on the first deploy. Fastagent sets it to the exact provider HTTPS origin before opening chat access. If supplied for an update, it must match the recorded URL exactly: no path, trailing slash, query, or credentials.
 
@@ -181,13 +181,15 @@ Interactive login opens the native gcloud login flow and requires a terminal. It
 
 Review the dry run, then remove `--dry-run` when you want to deploy. Fastagent uses Secret Manager for app secrets. It grants the runtime account access to app-owned secrets and allows public invocation of the service. It does not automatically grant broad project roles. Chat itself still requires the bearer token.
 
+Cloud Run verification uses the public HTTPS `/health` endpoint, not `/healthz` or just a container-startup result. See [Google's reserved-path issue](https://docs.cloud.google.com/run/docs/known-issues#ah). For an older generated app, add `/health` with the same bounded, unauthenticated, no-model history-store readiness handler as `/healthz`, retaining the old alias before updating. For `--no-traffic` updates, staged-revision readiness and post-promotion serving readiness are checked separately. API preflight queries only the five required services while preserving the output bound; `CLOUDRUN_OUTPUT_LIMIT` identifies overflow without exposing raw command output.
+
 ## 8. Update, inspect, or delete
 
 Deployment commands use the current app directory. `--target` defaults to the app name in `fastagent.yaml`.
 
 Repeat `deploy` with the same provider and target to update the recorded deployment. If an earlier mutation had an unknown result, the CLI may stop for manual reconciliation rather than risk duplicate resources.
 
-For `status`, `logs`, and `destroy`, use the same provider flags and authentication as deployment, but omit the runtime `--env-file` flags.
+For `status`, `logs`, `recover`, and `destroy`, use the same provider flags and authentication as deployment, but omit runtime `--env-file` flags. `status`, `logs`, and `recover` are read-only and do not acquire the mutation lock. A status result includes the local checkpoint and operation-lock diagnostics even when a locked target's remote status cannot be verified; `remoteStatusVerified: false` means it is not proof of readiness or ownership.
 
 ```sh
 # Example: inspect a Railway deployment
@@ -200,6 +202,22 @@ Deletion requires `destroy ... --yes`. It only deletes resources whose ownership
 
 Cloud Run logs show timestamps and severity only. Application payloads are withheld because they may contain secrets.
 
+### Inspect an interrupted deployment
+
+A command harness timeout (for example 600 seconds) is not evidence that Fastagent's deployment deadline expired, that a cloud build stopped, or that resource creation failed. Do not delete state, reset phases, or blindly recreate the target.
+
+From the same app directory, run `recover` with the original provider settings/authentication, but no runtime env files. For example:
+
+```sh
+node /path/to/fastagent/dist/cli.js recover --provider cloudrun \
+  --project PROJECT_ID --region REGION \
+  --runtime-account RUNTIME_EMAIL --build-account BUILD_EMAIL --json
+```
+
+Recovery is read-only. It reports `operation.state` (`active`, `owner-exited`, `unknown`, or `unlocked`), the private state directory, recorded resource IDs, a checkpoint, remote verification errors, and the same-target resume command. An active PID must not be displaced; owner-exited only means the local CLI owner is gone. Legacy or foreign-host locks cannot establish liveness. Check native child processes, Cloud Build and Cloud Run operations separately. Lock age alone is never sufficient.
+
+If remote verification fails or a recorded resource is missing, resolve that discrepancy before proceeding. Only after independently verifying every local/remote operation has finished, back up the private state directory and manually archive the exact lock identified in the report. Preserve the `.json` record, all IDs, namespace, and ownership marker unchanged. Rerun `recover`, then use its resume command with the same runtime env files if nonstandard. Deployment reconciles the existing target before any further mutation and may still refuse uncertain earlier phases rather than guess. Recovery does not itself remove a lock, promote traffic, mark a target ready, or deploy source.
+
 ## 9. Check health and use the dashboard
 
 From the app directory:
@@ -210,7 +228,7 @@ node /path/to/fastagent/dist/cli.js dashboard
 node /path/to/fastagent/dist/cli.js dashboard --json
 ```
 
-`check` requests HTTPS `/healthz`, does not follow redirects, and times out after five seconds. If both providers are recorded, choose `--provider`.
+`check` requests HTTPS `/health` on Cloud Run and `/healthz` on Railway, does not follow redirects, and times out after five seconds. Generated apps serve both. Cloud Run reserves some paths ending in `z`; older apps must add the no-model `GET /health` endpoint using the same history-store check and keep `/healthz` as an alias, then redeploy. There is no reserved-path fallback. If both providers are recorded, choose `--provider`.
 
 The dashboard only lists deployments saved on this machine. It does not discover all apps in your cloud accounts.
 
