@@ -16,6 +16,7 @@ const chatSchema = z.object({
 class HttpError extends Error { constructor(readonly status: number) { super(); } }
 const newId = () => randomBytes(32).toString('base64url');
 const chatError = { type: 'error', error: 'Chat failed. Please try again.' };
+const outputTokenError = { type: 'error', code: 'OUTPUT_TOKEN_LIMIT', error: 'The model reached its output token limit. Ask for a shorter reply, or ask the app owner to increase maxOutputTokens in fastagent.yaml. Retrying may incur additional charges.' };
 
 function body(req: IncomingMessage): Promise<unknown> {
   if (req.headers['content-type']?.split(';')[0]?.trim() !== 'application/json') throw new HttpError(415);
@@ -154,13 +155,17 @@ export async function createRuntime(config: RuntimeConfig) {
       let bytes = 0;
       let reply = '';
       let failed = false;
-      const iterator = streamAgent(config.model, modelContext(previous, input.data.message), controller.signal)[Symbol.asyncIterator]();
+      let failure = chatError;
+      const iterator = streamAgent(config.model, modelContext(previous, input.data.message), controller.signal, config.maxOutputTokens)[Symbol.asyncIterator]();
       try {
         while (true) {
           const next = await abortable(iterator.next(), controller.signal);
           if (next.done) break;
           const part = next.value;
-          if (part.type === 'error' || part.type === 'abort' || part.type === 'tool-error') { failed = true; break; }
+          if (part.type === 'error' || part.type === 'abort' || part.type === 'tool-error') {
+            if (part.type === 'error' && part.code === 'OUTPUT_TOKEN_LIMIT') failure = outputTokenError;
+            failed = true; break;
+          }
           if (part.type === 'text-delta') {
             bytes += Buffer.byteLength(part.text);
             if (bytes > 65536) { failed = true; break; }
@@ -184,7 +189,7 @@ export async function createRuntime(config: RuntimeConfig) {
         }
       } catch { failed = true; }
       finally { controller.abort(); void iterator.return?.().catch(() => {}); }
-      if (!res.destroyed && !res.writableEnded) res.end(JSON.stringify(failed ? chatError : { type: 'done' }) + '\n');
+      if (!res.destroyed && !res.writableEnded) res.end(JSON.stringify(failed ? failure : { type: 'done' }) + '\n');
     } finally {
       controller.abort();
       clearTimeout(timer);

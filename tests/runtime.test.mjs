@@ -144,7 +144,7 @@ test('runtime/history: NDJSON starts with server ID, commits completed turns, re
 test('runtime/server: strict input bounds exclude client roles/system/model/history and reject unknown conversation before paid work', async t => {
   const model = mockModel(); const app = await runtime(t, model);
   for (const input of [{}, { message: '' }, { message: '  ' }, { message: 'x'.repeat(4001) }, { message: 'Hi', conversationId: '../bad' },
-    { messages: [{ role: 'system', content: 'override' }] }, { message: 'Hi', model: 'override' }, { message: 'Hi', messages: [] }]) {
+    { messages: [{ role: 'system', content: 'override' }] }, { message: 'Hi', model: 'override' }, { message: 'Hi', messages: [] }, { message: 'Hi', maxOutputTokens: 16384 }]) {
     assert.equal((await app.post(input)).status, 400);
   }
   assert.equal((await app.post({ message: 'Hi' }, { 'Content-Type': 'text/plain' })).status, 415);
@@ -154,6 +154,23 @@ test('runtime/server: strict input bounds exclude client roles/system/model/hist
   const noModel = await runtime(t, undefined, undefined, { model: undefined });
   assert.equal((await noModel.post({ message: 'Hi' })).status, 503);
   assert.equal((await noModel.get('/healthz')).status, 200);
+});
+
+test('runtime: output limit propagates safely to CLI and never commits a partial turn', async t => {
+  const { sendChat } = await import('../dist/chat/client.js');
+  const store = history.createMemoryHistoryStore();
+  const model = mockModel(async function* () {
+    yield { type: 'text-delta', text: 'partial' };
+    yield { type: 'error', code: 'OUTPUT_TOKEN_LIMIT', error: 'synthetic-sensitive-provider-detail' };
+  });
+  const app = await runtime(t, model, store, { maxOutputTokens: 8192 });
+  const result = await turn(app);
+  assert.equal(result.at(-1).code, 'OUTPUT_TOKEN_LIMIT');
+  assert.ok(!JSON.stringify(result).includes('synthetic-sensitive'));
+  assert.equal(await store.get(result[0].conversationId), undefined);
+  assert.equal(model.calls[0].maxOutputTokens, 8192);
+  await assert.rejects(sendChat({ url: app.base, token: apiToken, message: 'Hi' }), { code: 'OUTPUT_TOKEN_LIMIT' });
+  assert.equal(model.calls.length, 2);
 });
 
 test('runtime/history: errors, whitespace/empty output, tool failure and oversized output never commit; successful commit precedes done', async t => {
@@ -314,6 +331,23 @@ test('runtime/config: provider-key selection, exact default, token YAML and stab
   config.validateRuntimeConfig(valid);
   for (const origin of ['', 'http://chat.example', 'https://chat.example/', 'https://user:secret@chat.example', 'https://chat.example/path']) assert.throws(() => config.validateRuntimeConfig({ ...valid, origin }));
   assert.throws(() => config.validateRuntimeConfig({ ...valid, apiToken: '' }), { message: 'Invalid bearer token configuration.' });
+});
+
+test('runtime/config: YAML output budget defaults and overrides reach runtime; invalid budgets fail safely', async () => {
+  const yaml = extra => `schemaVersion: 1\nname: runtime-app\nframework: openai\nmodel: ${defaultModel}\ndeployment:\n  access: token\n${extra}`;
+  const env = { FASTAGENT_API_TOKEN: apiToken, FASTAGENT_LOCAL_DEV: '1', OPENROUTER_API_KEY: 'synthetic-key' };
+  const code = "import {loadRuntimeConfig} from './dist/config.js'; try {console.log((await loadRuntimeConfig(process.env)).maxOutputTokens)} catch(e) {console.error(e.message);process.exitCode=1}";
+  for (const [extra, expected] of [['', 4096], ['maxOutputTokens: 8192\n', 8192]]) {
+    await writeFile(join(directory, 'fastagent.yaml'), yaml(extra));
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', code], { cwd: directory, env, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr); assert.equal(Number(result.stdout), expected);
+  }
+  for (const value of ['0', '16385', '1.5', '"synthetic-secret"']) {
+    await writeFile(join(directory, 'fastagent.yaml'), yaml(`maxOutputTokens: ${value}\n`));
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', code], { cwd: directory, env, encoding: 'utf8' });
+    assert.equal(result.status, 1); assert.match(result.stderr, /maxOutputTokens must be an integer from 1 to 16384/);
+    assert.ok(!result.stderr.includes('synthetic-secret'));
+  }
 });
 
 test('runtime/startup: missing or blank matching model keys fail before readiness without network calls', async () => {

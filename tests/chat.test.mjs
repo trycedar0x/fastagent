@@ -50,6 +50,27 @@ test('chat client: sends bearer only to the validated origin and does not follow
   await assert.rejects(sendChat({ url: 'https://chat.example', token, message: 'Hi', fetchImpl: async () => new Response(null, { status: 302, headers: { Location: 'https://evil.example' } }) }), (error) => error.code === 'CHAT_FAILED' && !String(error).includes(token));
 });
 
+test('chat client: allowlists output-limit codes but never trusts error text or arbitrary codes', async () => {
+  for (const code of ['OUTPUT_TOKEN_LIMIT', 'synthetic-sensitive-code', undefined]) {
+    let calls = 0;
+    const fetchImpl = async () => {
+      calls++;
+      return new Response([
+        { type: 'conversation', conversationId },
+        { type: 'delta', text: 'partial' },
+        { type: 'error', code, error: 'synthetic-sensitive-provider-detail' },
+      ].map(frame => JSON.stringify(frame)).join('\n'), { headers: { 'Content-Type': 'application/x-ndjson' } });
+    };
+    await assert.rejects(sendChat({ url: 'https://chat.example', token, message: 'Hi', fetchImpl }), error => {
+      assert.equal(error.code, code === 'OUTPUT_TOKEN_LIMIT' ? code : 'CHAT_FAILED');
+      assert.ok(!error.message.includes('synthetic-sensitive'));
+      if (code === 'OUTPUT_TOKEN_LIMIT') assert.match(error.message, /maxOutputTokens/);
+      return true;
+    });
+    assert.equal(calls, 1, 'must not automatically retry');
+  }
+});
+
 test('chat CLI: token comes only from the explicit env file, not arguments or the shell', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'fastagent-chat-'));
   const server = createServer((req, res) => {

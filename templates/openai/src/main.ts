@@ -8,6 +8,7 @@ try {
   const { server, abortAll, closeStore } = await createRuntime(config);
   server.on('error', () => { void closeStore(); process.stderr.write('Server failed to start. Check the port and configuration.\n'); process.exitCode = 1; });
   server.listen(Number(rawPort), config.localDev ? '127.0.0.1' : '0.0.0.0', () => {
+    if (config.localDev && !config.redisUrl) process.stderr.write('History is in memory and disappears on restart.\n');
     // A coding agent needs one parseable readiness line; humans get a sentence instead.
     process.stdout.write(process.env.FASTAGENT_DEV_JSON === '1'
       ? JSON.stringify({ ok: true, command: 'dev', url: config.origin }) + '\n'
@@ -25,6 +26,7 @@ try {
 } catch (error) {
   // Only known local configuration messages are exposed; never provider errors or secret values.
   const allowed = [
+    'maxOutputTokens must be an integer from 1 to 16384 in fastagent.yaml.',
     'Invalid fastagent.yaml configuration.', 'Invalid bearer token configuration.',
     'Invalid history namespace configuration.', 'REDIS_URL must configure Redis with TLS in production.',
     'Conversation service unavailable. Please try again.',

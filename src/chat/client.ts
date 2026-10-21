@@ -110,7 +110,7 @@ function statusError(status: number): FastagentError {
 
 function parseFrames(body: string, expectedId: string | undefined): ChatSuccess {
   const frames = body.split('\n').filter((line) => line.trim()).map((line) => {
-    try { return JSON.parse(line) as { type?: unknown; conversationId?: unknown; text?: unknown }; }
+    try { return JSON.parse(line) as { type?: unknown; conversationId?: unknown; text?: unknown; code?: unknown }; }
     catch { throw new FastagentError('CHAT_FAILED', 'Chat response was not valid NDJSON.'); }
   });
   const first = frames[0];
@@ -125,6 +125,10 @@ function parseFrames(body: string, expectedId: string | undefined): ChatSuccess 
     if (Buffer.byteLength(text) > 65536) throw new FastagentError('CHAT_FAILED', 'Chat response exceeded the output limit.');
   }
   const last = frames.at(-1);
+  // Trust only an allowlisted code, never server/provider text or arbitrary code values.
+  if (last?.type === 'error' && last.code === 'OUTPUT_TOKEN_LIMIT') {
+    throw new FastagentError('OUTPUT_TOKEN_LIMIT', 'The model reached its output token limit. Ask for a shorter reply, or ask the app owner to increase maxOutputTokens in fastagent.yaml. Retrying may incur additional charges.');
+  }
   if (!last || last.type !== 'done' || !text.trim()) throw new FastagentError('CHAT_FAILED', 'Chat did not complete.');
   return { conversationId: first.conversationId, text };
 }

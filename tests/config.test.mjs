@@ -15,6 +15,16 @@ test('config: strict versioned YAML round-trip and configurable model metadata',
   assert.equal(parseConfig(serializeConfig(legacy)).deployment.access, 'protected');
 });
 
+test('config: token app output budget is owner-controlled, bounded and preserved in YAML', () => {
+  for (const maxOutputTokens of [1, 4096, 16384]) {
+    const config = { ...valid(), maxOutputTokens };
+    assert.deepEqual(parseConfig(serializeConfig(config)), config);
+  }
+  for (const maxOutputTokens of [0, -1, 16385, 1.5, '4096', null, Infinity]) {
+    assert.throws(() => validateConfig({ ...valid(), maxOutputTokens }), { code: 'CONFIG_INVALID' });
+  }
+});
+
 test('config: rejects unsupported versions, frameworks, names, models and secret fields', () => {
   const invalid = [
     null, [], {},

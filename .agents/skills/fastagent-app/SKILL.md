@@ -21,6 +21,8 @@ There is no browser UI in a newly generated app. Do not add a password page or a
 
 In the CLI repository, adding a template asset also requires adding it to the manifest in `src/scaffold/render.ts`.
 
+Replace the sample temperature-conversion system prompt and tool together. Keep tool descriptions and input schemas aligned with implementations. Token apps accept owner-only top-level `maxOutputTokens` in `fastagent.yaml` (default 4096, integer 1–16384 per model step); clients cannot override it. Preserve the typed `OUTPUT_TOKEN_LIMIT` path without exposing provider details, saving partial replies, or retrying automatically.
+
 ## Preserve the runtime contract
 
 - Health never calls a model. It returns 200 when ready and may return 503 during Redis outages.

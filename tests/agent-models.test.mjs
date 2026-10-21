@@ -103,7 +103,7 @@ test('agent/SDK errors: failed finishes, in-stream errors and missing completion
   const logs = [];
   for (const method of ['error', 'warn', 'log', 'info', 'debug']) t.mock.method(console, method, (...args) => logs.push(args));
   for (const chunks of [
-    [chunk({ content: 'partial' }), chunk({}, 'length')], [chunk({}, 'content_filter')],
+    [chunk({}, 'content_filter')],
     [chunk({}, 'error')], [chunk({ content: 'partial' }), { error: { message: 'synthetic-secret', code: 500 } }],
     [chunk({ content: 'partial' })], [], [chunk({}, 'tool_calls')],
     [chunk({ tool_calls: [{ index: 0, function: { arguments: '{}' } }] }), chunk({}, 'tool_calls')],
@@ -117,6 +117,30 @@ test('agent/SDK errors: failed finishes, in-stream errors and missing completion
   assert.deepEqual(await collect(model), [{ type: 'error' }]); assert.equal(requests, 1);
   const truncated = agent.createModel('openrouter/vendor/model', 'synthetic-test-key', { fetch: async () => new Response('data: {broken-synthetic-secret}\n\n', { headers: { 'Content-Type': 'text/event-stream' } }) });
   assert.deepEqual(await collect(truncated), [{ type: 'error' }]); assert.deepEqual(logs, []);
+});
+
+test('agent/SDK token exhaustion is a safe typed failure for both providers, including reasoning-only output', async () => {
+  for (const reference of ['openrouter/vendor/model', 'openai/gpt-4o-mini']) {
+    for (const delta of [{ content: 'partial' }, { reasoning: 'internal-canary' }]) {
+      const parts = await collect(modelFor([chunk(delta), chunk({}, 'length')], reference));
+      assert.deepEqual(parts.at(-1), { type: 'error', code: 'OUTPUT_TOKEN_LIMIT' });
+      assert.ok(!JSON.stringify(parts).includes('internal-canary'));
+    }
+  }
+});
+
+test('agent/loop output budget defaults, overrides and rejects unsafe values before a model call', async () => {
+  const calls = [];
+  const model = { async *stream(call) { calls.push(call); yield { type: 'text-delta', text: 'ok' }; } };
+  for (const budget of [undefined, 1, 8192, 16384]) {
+    for await (const part of agent.streamAgent(model, [{ role: 'user', content: 'Hi' }], new AbortController().signal, budget)) {}
+    assert.equal(calls.at(-1).maxOutputTokens, budget ?? 4096);
+  }
+  for (const budget of [0, -1, 1.5, 16385, Infinity, NaN]) {
+    const count = calls.length, parts = [];
+    for await (const part of agent.streamAgent(model, [{ role: 'user', content: 'Hi' }], new AbortController().signal, budget)) parts.push(part);
+    assert.deepEqual(parts, [{ type: 'error' }]); assert.equal(calls.length, count);
+  }
 });
 
 test('agent/SDK completion: empty, whitespace-only and reasoning-only replies fail; visible text succeeds', async () => {

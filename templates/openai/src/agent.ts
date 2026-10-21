@@ -6,7 +6,8 @@ const system = 'You are a helpful chat assistant. Use the temperature conversion
 const toolList = Object.values(tools);
 
 const maxToolSteps = 3;
-const maxOutputTokensPerStep = 1024;
+export const defaultMaxOutputTokens = 4096;
+export const outputTokenLimit = 16384;
 // The approved bound applies to the complete request sent to the model: contextMessageLimit messages and
 // contextCharacterLimit characters, including the system prompt and any tool turns. Older whole
 // user/assistant pairs are dropped from the conversation slice to fit that budget; if the system prompt,
@@ -29,7 +30,7 @@ export interface ModelCall {
 export type ModelPart =
   | { type: 'text-delta'; text: string }
   | { type: 'tool-call'; toolCallId: string; toolName: string; input: string }
-  | { type: 'error' }
+  | { type: 'error'; code?: 'OUTPUT_TOKEN_LIMIT' }
   | { type: 'abort' }
   | { type: 'tool-error' };
 
@@ -96,6 +97,7 @@ export function createModel(identifier: string, apiKey: string | undefined, opti
           const choice = chunk.choices[0];
           if (choice?.finish_reason) {
             finishReason = choice.finish_reason;
+            if (finishReason === 'length') { yield { type: 'error', code: 'OUTPUT_TOKEN_LIMIT' }; return; }
             if (finishReason !== 'stop' && finishReason !== 'tool_calls') { yield { type: 'error' }; return; }
           }
           const delta = choice?.delta;
@@ -128,7 +130,8 @@ export function createModel(identifier: string, apiKey: string | undefined, opti
   };
 }
 
-export async function* streamAgent(model: ChatModel, messages: { role: 'user' | 'assistant'; content: string }[], abortSignal: AbortSignal): AsyncIterable<ModelPart> {
+export async function* streamAgent(model: ChatModel, messages: { role: 'user' | 'assistant'; content: string }[], abortSignal: AbortSignal, maxOutputTokens = defaultMaxOutputTokens): AsyncIterable<ModelPart> {
+  if (!Number.isSafeInteger(maxOutputTokens) || maxOutputTokens < 1 || maxOutputTokens > outputTokenLimit) { yield { type: 'error' }; return; }
   const slice: ModelMessage[] = [...messages];
   const toolTurns: ModelMessage[] = [];
   for (let step = 0; step < maxToolSteps; step++) {
@@ -138,7 +141,7 @@ export async function* streamAgent(model: ChatModel, messages: { role: 'user' | 
     const toolCalls: { id: string; name: string; input: string }[] = [];
     let failed: ModelPart | undefined;
     try {
-      for await (const part of model.stream({ messages: request, maxOutputTokens: maxOutputTokensPerStep, abortSignal, tools: toolList })) {
+      for await (const part of model.stream({ messages: request, maxOutputTokens, abortSignal, tools: toolList })) {
         if (part.type === 'text-delta') yield part;
         else if (part.type === 'tool-call') toolCalls.push({ id: part.toolCallId, name: part.toolName, input: part.input });
         else { failed = part; break; }

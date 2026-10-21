@@ -20,6 +20,7 @@ const tokenConfigSchema = z.strictObject({
   name: projectNameSchema,
   framework: z.literal('openai'),
   model: tokenModel,
+  maxOutputTokens: z.number().int().min(1).max(16384).optional(),
   deployment: z.strictObject({ access: z.literal('token') }),
 });
 export const projectConfigSchema = z.union([tokenConfigSchema, protectedConfigSchema]);
@@ -32,7 +33,7 @@ export function validateConfig(value: unknown): ProjectConfig {
     // Do not echo rejected config values, which could contain credentials.
     // Do not rewrite protected apps into token apps, or the reverse.
     throw new FastagentError('CONFIG_INVALID',
-      'Invalid fastagent.yaml: expected schemaVersion 1, a lowercase application name, framework openai, and deployment.access token or protected. Token apps require openrouter/<vendor>/<model> or openai/<model>. Existing protected apps are left unchanged; unknown fields are not allowed.');
+      'Invalid fastagent.yaml: expected schemaVersion 1, a lowercase application name, framework openai, and deployment.access token or protected. Token apps require openrouter/<vendor>/<model> or openai/<model>; optional maxOutputTokens must be an integer from 1 to 16384. Existing protected apps are left unchanged; unknown fields are not allowed.');
   }
   return result.data;
 }
