@@ -132,6 +132,8 @@ See the [user guide](docs/user-guide.md) for complete Railway and Cloud Run comm
 
 Existing apps created by the earlier password-protected release can still be deployed where safely possible; a generated token-access app is never silently rewritten into an old one.
 
+**Local development and live Cloud Run deployment have been verified.** See [Verification](#verification) for the tested functionality.
+
 ## Commands
 
 | Command | Purpose |
@@ -148,7 +150,7 @@ Existing apps created by the earlier password-protected release can still be dep
 | `dashboard` | View locally recorded deployments in a terminal |
 | `destroy` | Delete verified app-owned resources, with `--yes` |
 
-Run `node dist/cli.js --help` for exact arguments. Most commands support `--json`. `dev`, interactive login, and the interactive dashboard do not; `dashboard --json` returns an offline snapshot.
+Run `node dist/cli.js --help` for exact arguments. Most commands support `--json`. `dev --json` emits one readiness object and continues running; interactive login and the interactive dashboard require text mode. `dashboard --json` returns an offline snapshot.
 
 ## Current limits
 
@@ -161,8 +163,15 @@ Run `node dist/cli.js --help` for exact arguments. Most commands support `--json
 - Deleting an app may leave shared resources and costs behind.
 - There is no native iMessage integration. A separate Mac-side bridge can call this API, and cloud hosts cannot access Apple Messages.
 
-Local tests and mocked cloud tests pass. A fresh npm installation has been checked, including creating an app with the installed CLI. **Live cloud deployment, real Redis/Lua, Docker, browser behavior, and Windows still need verification.** Mock tests are not proof of a successful cloud deployment.
+Local development and live Cloud Run deployment have been verified. See [Verification](#verification) for the tested functionality.
 
+
+## Verification
+
+- **Local:** app creation, generated-app typecheck/build, startup, and health have been tested. Automated tests also cover bearer authentication, tool execution, conversation continuity, and history using injected models. The installed CLI's app-creation flow has been exercised.
+- **Cloud Run:** a live deployment reached ready/healthy, authentication checks passed, and two paid cloud requests verified a reply, conversation continuity, and four stored history messages.
+
+Live Railway deployment and real Redis/Lua integration still need verification. A successful health check never proves model access or reply quality.
 
 ## For coding assistants
 
