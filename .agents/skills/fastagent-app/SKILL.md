@@ -40,6 +40,8 @@ Replace the sample temperature-conversion system prompt and tool together. Keep 
 
 Do not commit or upload env files, bearer tokens, API keys, Redis URLs, cloud credentials, or conversation logs. Keep `.env.example` placeholder-only and builds credential-free. Preserve explicit Docker copies and ignore rules.
 
+Preserve both unauthenticated no-model health routes: `/health` is required for public Cloud Run checks; `/healthz` remains a compatibility alias for local/Railway clients. Both must run the same bounded history-store readiness check, not a model call. When upgrading an older app, add the alias explicitly; reinstalling the CLI does not rewrite generated app source.
+
 ## Validate
 
 Run `npm run typecheck` and `npm run build` in the app.

@@ -1,7 +1,7 @@
 import { constants } from 'node:fs';
 import { lstat, mkdir, open, opendir, realpath, rename, unlink } from 'node:fs/promises';
 import { createHash, randomBytes } from 'node:crypto';
-import { homedir } from 'node:os';
+import { homedir, hostname } from 'node:os';
 import { isAbsolute, join, normalize, parse, resolve } from 'node:path';
 import { z } from 'zod';
 import { projectNameSchema } from '../config/config.js';
@@ -52,9 +52,21 @@ export interface DeploymentLock {
   release(): Promise<void>;
 }
 const fail = (code = 'DEPLOYMENT_STATE_INVALID') => new FastagentError(code,
-  code === 'DEPLOYMENT_LOCKED' ? 'Deployment is locked by another operation; inspect partial resources before manually recovering a stale lock.' :
+  code === 'DEPLOYMENT_LOCKED' ? 'Deployment is locked by another operation. Run fastagent recover with the same provider flags/authentication for read-only diagnostics; never remove a lock based only on age or a harness timeout.' :
     'Deployment state is invalid, unsafe or changed concurrently; no resource operation is authorized.');
 const missing = (error: unknown) => (error as NodeJS.ErrnoException)?.code === 'ENOENT';
+const lockMetadataSchema = z.strictObject({
+  token: z.string().regex(/^[a-f0-9]{32}$/),
+  pid: z.number().int().positive().max(2147483647),
+  host: z.string().min(1).max(255),
+  createdAt: z.string().datetime(),
+});
+export interface DeploymentLockInfo {
+  state: 'unlocked' | 'active' | 'owner-exited' | 'unknown';
+  /** Local diagnostics only. No lock token is ever returned. A dead PID does not prove cloud work stopped. */
+  ownerPid?: number;
+  createdAt?: string;
+}
 
 export function deploymentKey(selector: DeploymentSelector): string {
   return createHash('sha256').update(JSON.stringify([selector.projectPath, selector.provider, selector.target])).digest('hex');
@@ -163,11 +175,30 @@ export class DeploymentStore {
     return record;
   }
 
+  /** Read-only best-effort diagnostics; never expires, steals, rewrites, or removes a lock. */
+  async inspectLock(input: DeploymentSelector): Promise<DeploymentLockInfo> {
+    const selector = await canonicalDeploymentSelector(input);
+    try { await safeDirectory(this.directory, false); }
+    catch (error) { if (missing(error)) return { state: 'unlocked' }; throw fail(); }
+    const source = await readPrivateFile(join(this.directory, `${deploymentKey(selector)}.lock`));
+    if (source === undefined) return { state: 'unlocked' };
+    let parsed;
+    try { parsed = lockMetadataSchema.safeParse(JSON.parse(source)); } catch { return { state: 'unknown' }; }
+    if (!parsed.success || parsed.data.host !== hostname()) return { state: 'unknown' };
+    const { pid, createdAt } = parsed.data;
+    try {
+      process.kill(pid, 0);
+      return { state: 'active', ownerPid: pid, createdAt };
+    } catch (error) {
+      return { state: (error as NodeJS.ErrnoException).code === 'ESRCH' ? 'owner-exited' : 'unknown', ownerPid: pid, createdAt };
+    }
+  }
+
   async acquire(input: DeploymentSelector): Promise<DeploymentLock> {
     const selector = await canonicalDeploymentSelector(input);
     await safeDirectory(this.directory);
     const key = deploymentKey(selector), file = join(this.directory, `${key}.json`), lockFile = join(this.directory, `${key}.lock`);
-    const token = randomBytes(16).toString('hex');
+    const token = JSON.stringify({ token: randomBytes(16).toString('hex'), pid: process.pid, host: hostname(), createdAt: new Date().toISOString() });
     let lockHandle;
     try {
       lockHandle = await open(lockFile, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);

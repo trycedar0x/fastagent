@@ -22,7 +22,7 @@ Usage:
   fastagent login --provider railway|cloudrun [--interactive] [--json]
   fastagent deploy --provider railway|cloudrun [--target <name>] [provider flags]
     [--env-file <file> ...] [--dry-run] [--json]  (env files auto-detected when omitted)
-  fastagent status|logs --provider railway|cloudrun [--target <name>] [provider flags] [--json]
+  fastagent status|logs|recover --provider railway|cloudrun [--target <name>] [provider flags] [--json]
   fastagent destroy --provider railway|cloudrun [--target <name>] [provider flags] --yes [--json]
   fastagent check [--provider railway|cloudrun] [--target <name>] [--json]
   fastagent dashboard [--provider railway|cloudrun] [--target <name>] [provider flags] [--json]
@@ -34,12 +34,14 @@ Name defaults to the directory basename; framework defaults to openai.
 New apps use deployment.access token and the official OpenAI SDK. The Vercel AI SDK is not supported.
 The product default model is openrouter/deepseek/deepseek-v4.1-flash. Existing protected apps are not rewritten.
 Starting an agent requires OPENROUTER_API_KEY for openrouter models, or OPENAI_API_KEY for openai models, in the app's ignored .env file. Missing or blank keys prevent startup. Local models are not supported. init and builds need no credentials.
-init and dev are implemented, alongside models/chat and login/deploy/status/logs/destroy.
+init and dev are implemented, alongside models/chat and login/deploy/status/logs/recover/destroy.
 models reads the public OpenRouter catalog. Prices are estimates with timestamps and source URLs; unknown prices stay unknown.
 chat is headless. It reads FASTAGENT_API_TOKEN only from explicit --env-file paths, never from arguments or the shell.
 Pass --message <text>, or --stdin (or --message -) to read piped stdin explicitly. Chat never reads stdin implicitly, so a coding-agent tool call cannot hang. --conversation resumes a server ID; omitting it starts a new conversation on every call. URL must be HTTPS or explicit localhost HTTP.
 Redirects are refused so the bearer token cannot be sent to another origin. Chat can incur model charges.
 Deployment commands use the current directory; target defaults to fastagent.yaml name.
+status/logs/recover are read-only and do not acquire mutation locks. recover reports lock owner liveness, recorded IDs and next steps; it never steals a lock, resets a checkpoint, or recreates resources. An exited CLI PID does not prove cloud work stopped. Use the same provider flags/auth as status; no runtime env files or --yes.
+Cloud Run public health uses /health; add that no-model endpoint to older apps and retain /healthz as an alias. Container startup alone is not public HTTPS health.
 Railway flags: --workspace <id> --auth-file <ignored-env-file>
   Account: RAILWAY_API_TOKEN. Project token: RAILWAY_TOKEN plus
   --railway-project <id> --railway-environment <id> (existing recorded targets only).
@@ -63,7 +65,7 @@ Deploy is billable; user-owned TLS Redis and cloud prerequisites are required.
 Cloud Run grants only app-secret access to the runtime account and public service invocation;
 no API enablement, billing setup or broad IAM grants. Logs may withhold payloads for safety.
 Destroy requires --yes and verified ownership; retained shared/build resources may remain billable.
-check reads the current project's saved target and requests bounded HTTPS /healthz only.
+check reads the current project's saved target and requests bounded HTTPS /health for Cloud Run or /healthz for Railway; never a model.
 If both providers are recorded, select --provider. Health does not certify model keys/tools.
 check --chat is not implemented (exit 2). Use fastagent chat for an explicit billable request.
 dashboard requires a TTY; --json returns LOCAL cached records without network requests.
@@ -194,7 +196,7 @@ async function run(): Promise<void> {
       }
       return;
     }
-    if (['login', 'deploy', 'status', 'logs', 'destroy'].includes(positionals[0] ?? '')) {
+    if (['login', 'deploy', 'status', 'logs', 'destroy', 'recover'].includes(positionals[0] ?? '')) {
       if (positionals.length !== 1 || values.name !== undefined || values.framework !== undefined || values.install !== undefined || !['railway', 'cloudrun'].includes(values.provider ?? '')) {
         throw new FastagentError('INVALID_ARGUMENTS', 'Deployment commands require --provider railway|cloudrun and use the current directory. See --help.', 2);
       }

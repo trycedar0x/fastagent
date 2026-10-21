@@ -112,6 +112,60 @@ test('deployment service deploy/update/status/logs/destroy: stable identity, red
   assert.deepEqual(await readdir(f.store.directory), []);
 });
 
+test('status/logs/recover remain read-only under an active or legacy lock and preserve every checkpoint byte', async t => {
+  const f = await fixture(t);
+  const deps = { ...f.deps, provider: provider() };
+  await executeDeployment(f.options, deps);
+  const record = await saved(f);
+  const selector = { projectPath: f.cwd, provider: 'railway', target: 'agent' };
+  const lock = await f.store.acquire(selector);
+  const statePath = join(f.store.directory, `${record.key}.json`), lockPath = join(f.store.directory, `${record.key}.lock`);
+  const before = await readFile(statePath, 'utf8'), lockBefore = await readFile(lockPath, 'utf8');
+  const lifecycle = { ...f.options, envFiles: undefined };
+  const status = await executeDeployment({ ...lifecycle, command: 'status' }, deps);
+  assert.equal(status.operation.state, 'active'); assert.equal(status.remoteStatusVerified, true);
+  assert.match(formatDeploymentResult(status), /Operation lock: active/);
+  const recover = await executeDeployment({ ...lifecycle, command: 'recover' }, deps);
+  assert.equal(recover.readOnly, true); assert.equal(recover.operation.state, 'active');
+  assert.equal(recover.resumeBlocked, true); assert.equal(recover.resumeRequiresConfirmation, true);
+  assert.deepEqual(recover.resources, record.resources);
+  assert.ok(recover.nextSteps.some(step => step.includes('Do not archive')));
+  assert.ok(recover.resumeCommand.includes('deploy'));
+  assert.ok(recover.resumeCommand.includes('workspace-test'));
+  assert.match(formatDeploymentResult(recover), /recovery inspection \(read-only\)/);
+  await executeDeployment({ ...lifecycle, command: 'logs' }, deps);
+  assert.equal(await readFile(statePath, 'utf8'), before);
+  assert.equal(await readFile(lockPath, 'utf8'), lockBefore);
+  await assert.rejects(executeDeployment(f.options, deps), code('DEPLOYMENT_LOCKED'));
+  await lock.release();
+  await writeFile(lockPath, 'f'.repeat(32), { mode: 0o600 });
+  const legacy = await executeDeployment({ ...lifecycle, command: 'recover' }, deps);
+  assert.equal(legacy.operation.state, 'unknown');
+  assert.ok(legacy.nextSteps.some(step => step.includes('legacy')));
+  assert.equal(await readFile(statePath, 'utf8'), before);
+  assert.equal(await readFile(lockPath, 'utf8'), 'f'.repeat(32));
+  for (const secret of [...Object.values(secrets), token]) assert.ok(!JSON.stringify(legacy).includes(secret));
+  const failure = await executeDeployment({ ...lifecycle, command: 'recover' }, { ...deps, provider: provider({ status: async () => { const error = new Error('synthetic-sensitive-provider-payload'); throw error; } }) });
+  assert.equal(failure.remoteStatusVerified, false); assert.equal(failure.resumeBlocked, true);
+  assert.equal(failure.statusSource, 'cached');
+  assert.equal(failure.remoteErrorCode, 'DEPLOYMENT_FAILED');
+  assert.ok(!JSON.stringify(failure).includes('synthetic-sensitive-provider-payload'));
+  assert.equal(await readFile(lockPath, 'utf8'), 'f'.repeat(32));
+  await assert.rejects(executeDeployment({ ...lifecycle, command: 'recover', yes: true }, deps), code('INVALID_ARGUMENTS'));
+});
+
+test('recover CLI is registered, rejects mutation/env flags and reports missing state without cloud calls', async t => {
+  const f = await fixture(t);
+  const args = ['recover', '--provider', 'railway', '--workspace', 'workspace-test', '--auth-file', '.env.railway'];
+  const result = invoke([...args, '--json'], f.cwd, f.root);
+  assert.equal(result.status, 1, result.stdout + result.stderr);
+  assert.equal(JSON.parse(result.stdout).error.code, 'DEPLOYMENT_NOT_FOUND');
+  for (const flags of [['--yes'], ['--env-file', '.env'], ['--dry-run']]) {
+    const rejected = invoke([...args, ...flags, '--json'], f.cwd, f.root);
+    assert.equal(rejected.status, 2); assert.equal(JSON.parse(rejected.stdout).error.code, 'INVALID_ARGUMENTS');
+  }
+});
+
 test('deployment explicit nonsecret origin/namespace remain useful in output while known secrets are redacted', async (t) => {
   const f = await fixture(t);
   await writeFile(join(f.cwd, '.env.production'), 'APP_ORIGIN=https://agent.example.invalid\nFASTAGENT_HISTORY_NAMESPACE=agent\n');

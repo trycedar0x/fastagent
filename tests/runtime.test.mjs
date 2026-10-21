@@ -60,6 +60,9 @@ test('runtime/server: headless health is public, serves no assets/login and neve
   const model = mockModel(); const app = await runtime(t, model);
   const response = await fetch(app.base + '/healthz');
   assert.equal(response.status, 200); assert.deepEqual(await response.json(), { ok: true });
+  const publicHealth = await fetch(app.base + '/health');
+  assert.equal(publicHealth.status, 200); assert.deepEqual(await publicHealth.json(), { ok: true });
+  assert.equal((await fetch(app.base + '/health?probe=1')).status, 404);
   for (const path of ['/', '/app.js', '/style.css', '/api/session', '/api/login', '/api/logout', '/.env']) assert.equal((await app.get(path)).status, 404);
   assert.equal(model.calls.length, 0);
 });
@@ -290,7 +293,7 @@ test('runtime/history: outage fails closed before model, health reports unavaila
   const model = mockModel(); const app = await runtime(t, model, failing);
   const conversationId = (await turn(app))[0].conversationId;
   unavailable = true;
-  for (const response of [await app.get('/healthz'), await app.get('/api/conversations/' + conversationId), await app.delete(conversationId), await app.post({ message: 'Hi', conversationId })]) {
+  for (const response of [await app.get('/health'), await app.get('/healthz'), await app.get('/api/conversations/' + conversationId), await app.delete(conversationId), await app.post({ message: 'Hi', conversationId })]) {
     assert.equal(response.status, 503); assert.deepEqual(await response.json(), { error: 'Conversation service unavailable. Please try again.' });
   }
   assert.equal(model.calls.length, 1);

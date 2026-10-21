@@ -142,7 +142,8 @@ Existing apps created by the earlier password-protected release can still be dep
 | `chat` | Send one headless message using an explicit token file |
 | `login` | Show Railway token instructions or start explicit Cloud Run login |
 | `deploy` | Create or update a recorded deployment |
-| `status` / `logs` | Inspect a deployment |
+| `status` / `logs` | Inspect a deployment without blocking on mutation locks |
+| `recover` | Read-only interruption diagnostics and manual recovery next steps |
 | `check` | Check its HTTP health endpoint, without calling a model |
 | `dashboard` | View locally recorded deployments in a terminal |
 | `destroy` | Delete verified app-owned resources, with `--yes` |

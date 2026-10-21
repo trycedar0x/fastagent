@@ -48,11 +48,13 @@ export async function checkHealth(record: DeploymentRecord, options: { signal?: 
   try {
     validateDeploymentRecord(record);
     if (!record.url) return { health: 'unavailable', lastChecked, detail: 'No recorded HTTPS URL.' };
-    const response = await (options.http ?? createDeploymentHttp(fetch, 5000))({ url: `${record.url}/healthz`, method: 'GET', headers: {},
+    // Existing Railway apps keep /healthz; Cloud Run's public frontend can reserve z-suffixed paths.
+    const path = record.provider === 'cloudrun' ? '/health' : '/healthz';
+    const response = await (options.http ?? createDeploymentHttp(fetch, 5000))({ url: `${record.url}${path}`, method: 'GET', headers: {},
       signal: options.signal ?? new AbortController().signal, maxResponseBytes: 4096 });
     if (response.status !== 200 || !response.body || typeof response.body !== 'object' || Array.isArray(response.body) || (response.body as { ok?: unknown }).ok !== true) throw new Error();
-    return { health: 'healthy', lastChecked, detail: 'HTTPS /healthz returned ok:true; chat was not tested.' };
-  } catch { return { health: 'unhealthy', lastChecked, detail: 'Health request failed, timed out, or returned an invalid response; chat was not tested.' }; }
+    return { health: 'healthy', lastChecked, detail: `HTTPS ${path} returned ok:true; chat was not tested.` };
+  } catch { return { health: 'unhealthy', lastChecked, detail: `Health request failed, timed out, or returned an invalid response; chat was not tested.${record.provider === 'cloudrun' ? ' Cloud Run requires an app GET /health endpoint returning {"ok":true}; add it to older apps and redeploy, retaining /healthz as an alias.' : ''}` }; }
 }
 
 export async function selectCheckRecord(options: RecordFilters & { cwd?: string }, store = new DeploymentStore()): Promise<DeploymentRecord> {

@@ -95,7 +95,7 @@ export async function createRuntime(config: RuntimeConfig) {
   server.maxConnections = 100;
   async function handle(req: IncomingMessage, res: ServerResponse) {
     const path = (req.url ?? '').split('?')[0];
-    if (req.method === 'GET' && req.url === '/healthz') {
+    if (req.method === 'GET' && (req.url === '/health' || req.url === '/healthz')) {
       await safeStore(() => store.check()); json(res, 200, { ok: true }); return;
     }
     const historyRoute = /^\/api\/conversations\/([A-Za-z0-9_-]{43})$/.exec(path!);

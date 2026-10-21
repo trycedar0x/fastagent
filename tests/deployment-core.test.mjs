@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { chmod, lstat, mkdir, readFile, readdir, realpath, symlink, writeFile } from 'node:fs/promises';
+import { hostname } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createConfig } from '../dist/config/config.js';
 import { renderProject } from '../dist/scaffold/render.js';
@@ -185,6 +186,32 @@ test('deployment state: private atomic checkpoints resume partial failure withou
   assert.equal((await lstat(store.directory)).mode & 0o077, 0);
   assert.equal((await lstat(join(store.directory, `${record.key}.json`))).mode & 0o077, 0);
   assert.deepEqual(await readdir(store.directory), [`${record.key}.json`]);
+});
+
+test('deployment lock diagnostics never steal active, exited, foreign or legacy locks and never expose lock tokens', async t => {
+  const root = await temporaryDirectory(t), store = new DeploymentStore(join(root, 'state'));
+  const selector = { projectPath: root, provider: 'cloudrun', target: 'agent' };
+  assert.deepEqual(await store.inspectLock(selector), { state: 'unlocked' });
+  const lock = await store.acquire(selector);
+  const path = join(store.directory, `${deploymentKey(selector)}.lock`);
+  const original = await readFile(path, 'utf8');
+  const active = await store.inspectLock(selector);
+  assert.equal(active.state, 'active'); assert.equal(active.ownerPid, process.pid);
+  assert.ok(!JSON.stringify(active).includes(JSON.parse(original).token));
+  await assert.rejects(store.acquire(selector), code('DEPLOYMENT_LOCKED'));
+  assert.equal(await readFile(path, 'utf8'), original);
+  await lock.release();
+  const fixtures = [
+    ['a'.repeat(32), 'unknown'],
+    [JSON.stringify({ token: 'b'.repeat(32), pid: process.pid, host: 'foreign-host.invalid', createdAt: new Date().toISOString() }), 'unknown'],
+    [JSON.stringify({ token: 'b'.repeat(32), pid: 2147483647, host: hostname(), createdAt: new Date().toISOString() }), 'owner-exited'],
+  ];
+  for (const [content, expected] of fixtures) {
+    await writeFile(path, content, { mode: 0o600 });
+    assert.equal((await store.inspectLock(selector)).state, expected);
+    assert.equal(await readFile(path, 'utf8'), content);
+    await assert.rejects(store.acquire(selector), code('DEPLOYMENT_LOCKED'));
+  }
 });
 
 test('deployment state: fail-fast concurrent locks, stale revisions and immutable selectors/markers', async (t) => {

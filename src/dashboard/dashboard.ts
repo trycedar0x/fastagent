@@ -112,6 +112,7 @@ export async function runDashboard(options: RecordActionOptions = {}, dependenci
           else {
             const result = await action(record, kind === 'logs' ? 'logs' : 'status', { ...options, signal: operation.signal });
             notice = kind === 'logs' ? `Logs (first 3 lines; use fastagent logs for the full bounded output):\n${String(result.logs ?? '').slice(0, 4000)}`
+              : result.remoteStatusVerified === false ? 'Provider status could not be verified. The displayed checkpoint is cached; run fastagent recover with the same provider flags for diagnostics.'
               : `Explicit provider status for ${record.provider}/${record.target}: ${clean(String(result.status ?? 'unknown'))}. Recorded status remains cached.`;
           }
           if (kind === 'refresh' && !operation.signal.aborted) await refreshHealth(operation.signal);
