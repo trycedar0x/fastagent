@@ -4,6 +4,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createCloudRunProvider } from '../dist/deployment/providers/cloudrun.js';
 import { createDeploymentRecord, deploymentKey, validateDeploymentRecord, DeploymentStore } from '../dist/deployment/state.js';
+import { runtimeSecretKeys } from '../dist/deployment/types.js';
 import { temporaryDirectory } from './helpers.mjs';
 
 const project = 'fixture-project', region = 'us-central1', service = 'agent';
@@ -15,10 +16,40 @@ const keys = ['FASTAGENT_PASSWORD_HASH', 'OPENAI_API_KEY', 'REDIS_URL'];
 const environment = () => ({ FASTAGENT_PASSWORD_HASH: `scrypt-v1$${'a'.repeat(32)}$${'b'.repeat(128)}`,
   OPENAI_API_KEY: 'synthetic-model-credential', REDIS_URL: 'rediss://fixture:synthetic-redis-credential@redis.invalid/0',
   FASTAGENT_SESSION_NAMESPACE: 'cloudrun-test' });
+const tokenApiToken = 't'.repeat(43);
+const tokenEnvironment = (extra = {}) => ({ FASTAGENT_API_TOKEN: tokenApiToken, OPENROUTER_API_KEY: 'synthetic-openrouter-credential',
+  REDIS_URL: 'rediss://fixture:synthetic-redis-credential@redis.invalid/0', FASTAGENT_HISTORY_NAMESPACE: 'cloudrun-ephemeral', ...extra });
+const ephemeralEnvironment = () => ({ FASTAGENT_API_TOKEN: tokenApiToken, OPENROUTER_API_KEY: 'synthetic-openrouter-credential',
+  FASTAGENT_EPHEMERAL_HISTORY: '1', FASTAGENT_HISTORY_NAMESPACE: 'cloudrun-ephemeral' });
 const code = (expected) => (error) => { assert.equal(error.code, expected); assert.ok(!error.message.includes(environment().OPENAI_API_KEY)); return true; };
+test('Cloud Run: local option errors identify the setting without echoing input', () => {
+  const options = { project, region, service, runtimeServiceAccount: runtime, buildServiceAccount: build,
+    commandEnv: {}, health: async () => ({ status: 200, body: { ok: true } }) };
+  for (const [change, expected] of [
+    [{ project: 'synthetic-invalid-input' + '!'}, '--project'],
+    [{ region: 'synthetic-invalid-input' }, '--region'],
+    [{ service: 'synthetic-invalid-input!' }, 'service name'],
+    [{ runtimeServiceAccount: 'synthetic-invalid-input' }, '--runtime-account'],
+    [{ buildServiceAccount: `build@${project}.iam.gserviceaccount.com` }, '--build-account'],
+    [{ buildServiceAccount: runtime }, 'must differ'],
+    [{ commandEnv: { UNTRUSTED: 'synthetic-invalid-input' } }, 'commandEnv'],
+    [{ health: undefined }, 'health'],
+    [{ requestTimeoutMs: 0 }, 'requestTimeoutMs'],
+  ]) {
+    assert.throws(() => createCloudRunProvider({ ...options, ...change }), (error) => {
+      assert.equal(error.code, 'CLOUDRUN_OPTIONS_INVALID');
+      assert.ok(error.message.includes(expected), error.message);
+      assert.ok(!error.message.includes('synthetic-invalid-input'));
+      if (change.buildServiceAccount?.startsWith('build@')) assert.match(error.message, /6–30/);
+      return true;
+    });
+  }
+});
+
 const help = '--source --service-account --build-service-account --port --max --max-instances --timeout --concurrency --set-env-vars --set-secrets --no-traffic --[no-]allow-unauthenticated --[no-]invoker-iam-check --[no-]deploy-health-check --labels --to-revisions --clear-tags --replication-policy --data-file --member --role --condition --limit';
 
-async function fixture(t, changes = {}, overrides = {}) {
+async function fixture(t, changes = {}, overrides = {}, runtimeEnv = environment()) {
+  const secretKeys = runtimeSecretKeys(runtimeEnv);
   const root = await temporaryDirectory(t), projectPath = join(root, 'project'), directory = join(root, 'stage');
   await mkdir(projectPath); await mkdir(directory);
   await writeFile(join(directory, 'Dockerfile'), await readFile(new URL('../templates/openai/Dockerfile', import.meta.url)));
@@ -71,11 +102,11 @@ async function fixture(t, changes = {}, overrides = {}) {
       if (a[2] === 'list') output = s.versions;
       else {
         assert.equal(a[2], 'add'); assert.ok(a.includes('--data-file=-')); assert.equal(current.status, 'deploying');
-        assert.ok(keys.some((key) => environment()[key] === request.stdin));
+        assert.ok(secretKeys.some((key) => runtimeEnv[key] === request.stdin));
         const name = `${s.name}/versions/${s.versions.length + 1}`;
         output = { name, state: 'ENABLED', createTime: '2026-01-01T00:00:00Z', replicationStatus: { automatic: {} } };
         s.versions.push(output);
-        if (remote.versionError) throw new Error(environment().OPENAI_API_KEY);
+        if (remote.versionError) throw new Error(runtimeEnv.OPENAI_API_KEY ?? runtimeEnv.OPENROUTER_API_KEY);
       }
     } else if (a[0] === 'secrets' && a[1] === 'add-iam-policy-binding') {
       assert.equal(value(a, '--member'), `serviceAccount:${runtime}`); assert.ok(a.includes('--role=roles/secretmanager.secretAccessor'));
@@ -104,7 +135,7 @@ async function fixture(t, changes = {}, overrides = {}) {
           latestCreatedRevisionName: revision, latestReadyRevisionName: remote.wrongRevision ? 'agent-unrelated' : revision,
           url: remote.url ?? origin, traffic: remote.service?.status.traffic ?? [{ revisionName: revision, percent: 100 }] } };
       if (remote.localDev) remote.service.spec.template.spec.containers[0].env.push({ name: 'FASTAGENT_LOCAL_DEV', value: '1' });
-      if (remote.literalSecret) remote.service.spec.template.spec.containers[0].env.find((e) => e.name === 'REDIS_URL').value = environment().REDIS_URL;
+      if (remote.literalSecret) remote.service.spec.template.spec.containers[0].env.find((e) => e.name === 'REDIS_URL').value = runtimeEnv.REDIS_URL;
       if (remote.unsafeCap) remote.service.metadata.annotations['run.googleapis.com/maxScale'] = '2';
       if (remote.originDrift) remote.service.spec.template.spec.containers[0].env.find((e) => e.name === 'APP_ORIGIN').value = 'https://wrong.invalid';
       output = remote.service;
@@ -123,7 +154,7 @@ async function fixture(t, changes = {}, overrides = {}) {
         assert.ok(a.includes('--member=allUsers')); assert.ok(a.includes('--role=roles/run.invoker'));
         if (remote.publicDenied) throw new Error('organization policy');
         remote.public = true; output = { version: 1, bindings: [{ role: 'roles/run.invoker', members: ['allUsers'] }] };
-      } else if (a[2] === 'logs') output = remote.logs ?? [{ timestamp: '2026-01-01T00:00:00Z', severity: 'INFO', textPayload: `${environment().OPENAI_API_KEY} unknown-historical-secret`, resource: { type: 'cloud_run_revision' } }];
+      } else if (a[2] === 'logs') output = remote.logs ?? [{ timestamp: '2026-01-01T00:00:00Z', severity: 'INFO', textPayload: `${runtimeEnv.OPENAI_API_KEY ?? runtimeEnv.OPENROUTER_API_KEY} unknown-historical-secret`, resource: { type: 'cloud_run_revision' } }];
       else if (a[2] === 'delete') { assert.equal(request.authorization, 'destruction'); if (!remote.retainDeleted) remote.service = undefined; output = {}; }
       else throw new Error(`unsupported ${a.join(' ')}`);
     } else throw new Error(`unsupported ${a.join(' ')}`);
@@ -137,8 +168,8 @@ async function fixture(t, changes = {}, overrides = {}) {
   };
   const options = { project, region, service, runtimeServiceAccount: runtime, buildServiceAccount: build, commandEnv: { PATH: '/synthetic/bin', HOME: '/synthetic/home' },
     health, pollIntervalMs: 1, requestTimeoutMs: 100, deploymentTimeoutMs: 1000, onDiagnostic: (message) => diagnostics.push(message), ...overrides };
-  const input = { selector, state, runner, environment: environment(), source: { directory, config: { schemaVersion: 1, name: 'agent', framework: 'openai', model: 'openai/gpt-4o-mini', deployment: { access: 'protected' } }, files: ['Dockerfile', '.gcloudignore', 'fastagent.yaml'], bytes: 0, cleanup: async () => {} } };
-  return { provider: createCloudRunProvider(options), options, input, state, remote, requests, checkpoints, events, diagnostics,
+  const input = { selector, state, runner, environment: runtimeEnv, source: { directory, config: { schemaVersion: 1, name: 'agent', framework: 'openai', model: 'openai/gpt-4o-mini', deployment: { access: 'protected' } }, files: ['Dockerfile', '.gcloudignore', 'fastagent.yaml'], bytes: 0, cleanup: async () => {} } };
+  return { provider: createCloudRunProvider(options), options, input, state, remote, requests, checkpoints, events, diagnostics, secretKeys, runtimeEnv,
     record: () => structuredClone(current), replace: async (record) => state.write(record), markDestroying: async () => state.write({ ...current, status: 'destroying', phase: 'destroy-pending' }) };
 }
 
@@ -179,6 +210,31 @@ test('cloudrun fresh deploy: predictable protected private origin, owned metadat
   const publicIndex = f.events.findIndex((e) => e.request?.args.includes('--member=allUsers'));
   assert.ok(traffic < publicIndex); assert.ok(f.checkpoints.some((c) => c.phase === 'source-uploaded' && c.status === 'deploying'));
   assert.deepEqual(await f.provider.status(f.input, record), { status: 'ready', url: origin });
+});
+
+test('cloudrun token ephemeral: no Redis secret, opt-in env var, single-instance pin, private then public', async (t) => {
+  const f = await fixture(t, {}, {}, ephemeralEnvironment());
+  const record = await f.provider.deploy(f.input);
+  assert.equal(record.status, 'ready'); assert.equal(record.phase, 'healthy'); assert.equal(record.sessionNamespace, 'cloudrun-ephemeral');
+  assert.equal(record.resources.filter((r) => r.kind === 'secret').length, 4);
+  const deploy = f.requests.find((r) => r.args[0] === 'run' && r.args[1] === 'deploy' && !r.args.includes('--help'));
+  assert.ok(deploy.args.includes('--max-instances=1')); assert.ok(deploy.args.includes('--max=1'));
+  assert.ok(deploy.args[deploy.args.indexOf('--set-env-vars') + 1].includes('FASTAGENT_EPHEMERAL_HISTORY=1'));
+  assert.ok(!deploy.args.join(' ').includes('REDIS_URL'));
+  const added = f.requests.filter((r) => r.args[0] === 'secrets' && r.args[1] === 'versions' && r.args[2] === 'add' && !r.args.includes('--help'));
+  assert.deepEqual(added.map((r) => r.stdin).sort(), [tokenApiToken, 'synthetic-openrouter-credential'].sort());
+  assert.ok(!JSON.stringify(f.checkpoints).includes(tokenApiToken));
+  assert.deepEqual(await f.provider.status(f.input, record), { status: 'ready', url: origin });
+});
+
+test('cloudrun token Redis: REDIS_URL stays a pinned secret and no ephemeral flag is injected', async (t) => {
+  const f = await fixture(t, {}, {}, tokenEnvironment());
+  const record = await f.provider.deploy(f.input);
+  assert.equal(record.status, 'ready');
+  const deploy = f.requests.find((r) => r.args[0] === 'run' && r.args[1] === 'deploy' && !r.args.includes('--help'));
+  assert.ok(deploy.args[deploy.args.indexOf('--set-secrets') + 1].includes('REDIS_URL='));
+  assert.ok(!deploy.args[deploy.args.indexOf('--set-env-vars') + 1].includes('FASTAGENT_EPHEMERAL_HISTORY'));
+  assert.equal(f.requests.filter((r) => r.stdin).length, 3);
 });
 
 test('cloudrun prewritten prepared revision acquires origin without changing ownership or namespace', async (t) => {

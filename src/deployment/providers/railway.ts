@@ -3,13 +3,13 @@ import { FastagentError } from '../../errors.js';
 import { redactProcessOutput } from '../process.js';
 import { createDeploymentRecord, deploymentKey, validateDeploymentRecord, type DeploymentRecord } from '../state.js';
 import { isApprovedDockerfile } from '../dockerfiles.js';
-import { redisNamespace, redisNamespaceVariable, runtimeSecretKeys, secretValue, validateCloudEnvironment, validateHttpsOrigin, validatePreflightEnvironment,
+import { isTokenRuntime, redisNamespace, redisNamespaceVariable, runtimeSecretKeys, secretValue, validateCloudEnvironment, validateHttpsOrigin, validatePreflightEnvironment,
   type CloudEnvironment, type DeploymentProvider, type DeployInput, type DestroyInput, type PreflightEnvironment,
   type ProviderContext, type ProviderStatus } from '../types.js';
 
 const API = 'https://backboard.railway.com/graphql/v2';
 const MARKER = 'FASTAGENT_OWNERSHIP_MARKER';
-const nonSecretVariables = ['APP_ORIGIN', 'FASTAGENT_SESSION_NAMESPACE', 'FASTAGENT_HISTORY_NAMESPACE', 'PORT'];
+const nonSecretVariables = ['APP_ORIGIN', 'FASTAGENT_SESSION_NAMESPACE', 'FASTAGENT_HISTORY_NAMESPACE', 'FASTAGENT_EPHEMERAL_HISTORY', 'PORT'];
 const idPattern = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const failure = (code: string) => new FastagentError(code,
   'Railway operation could not be verified. Inspect the recoverable checkpoint and remote resources before retrying; no automatic creation retry is authorized.');
@@ -57,8 +57,10 @@ export interface RailwayOptions {
 }
 
 /** Railway variables are available to platform builds too. Staging's standard Dockerfile must
- * consume no secret ARGs. Replica configuration is a cost default, NOT a singleton guarantee;
- * existing region overrides/rollout overlap can exceed one process. Shared TLS Redis is mandatory.
+ * consume no secret ARGs. Replica configuration is a cost default, NOT a per-revision singleton
+ * guarantee; existing region overrides/rollout overlap can exceed one process at once. Shared TLS
+ * Redis is the default, and is mandatory unless the explicit FASTAGENT_EPHEMERAL_HISTORY=1 opt-in
+ * pins a single instance and accepts in-memory, restart-losing history.
  * Official commands: https://docs.railway.com/cli/{init,add,domain,up,variable,deployment,logs}
  * API deletion: https://docs.railway.com/integrations/api/manage-services (serviceDelete only).
  */
@@ -295,11 +297,18 @@ export function createRailwayProvider(options: RailwayOptions): DeploymentProvid
       if (variables.FASTAGENT_SESSION_NAMESPACE !== undefined || variables.FASTAGENT_PASSWORD_HASH !== undefined) throw failure('RAILWAY_UNSAFE_REMOTE_ENV');
       const modelKeys = ['OPENAI_API_KEY', 'OPENROUTER_API_KEY'].filter((key) => variables[key] !== undefined);
       if (modelKeys.length !== 1) throw failure('RAILWAY_UNSAFE_REMOTE_ENV');
+      const redis = variables.REDIS_URL !== undefined;
+      const ephemeral = variables.FASTAGENT_EPHEMERAL_HISTORY !== undefined;
+      // Exactly one history backend, mirroring local preflight; never guess between them.
+      if (redis === ephemeral) throw failure('RAILWAY_UNSAFE_REMOTE_ENV');
+      if (ephemeral && variables.FASTAGENT_EPHEMERAL_HISTORY !== '1') throw failure('RAILWAY_UNSAFE_REMOTE_ENV');
       return validateCloudEnvironment({
         FASTAGENT_API_TOKEN: variables.FASTAGENT_API_TOKEN,
         ...(variables.OPENAI_API_KEY !== undefined ? { OPENAI_API_KEY: variables.OPENAI_API_KEY } : {}),
         ...(variables.OPENROUTER_API_KEY !== undefined ? { OPENROUTER_API_KEY: variables.OPENROUTER_API_KEY } : {}),
-        REDIS_URL: variables.REDIS_URL, APP_ORIGIN: variables.APP_ORIGIN,
+        ...(redis ? { REDIS_URL: variables.REDIS_URL } : {}),
+        ...(ephemeral ? { FASTAGENT_EPHEMERAL_HISTORY: '1' } : {}),
+        APP_ORIGIN: variables.APP_ORIGIN,
         FASTAGENT_HISTORY_NAMESPACE: variables.FASTAGENT_HISTORY_NAMESPACE,
       });
     }
@@ -389,15 +398,24 @@ export function createRailwayProvider(options: RailwayOptions): DeploymentProvid
       const secrets = keys.map((key) => secretValue(full, key));
       for (const key of keys) await command(input,
         ['variable', 'set', key, '--stdin', '--skip-deploys', ...serviceScoped(record)], 'mutate', secretValue(full, key), secrets);
+      // Ephemeral mode injects no REDIS_URL secret and adds the explicit opt-in flag as a non-secret variable.
+      const ephemeralMode = isTokenRuntime(full) && full.FASTAGENT_EPHEMERAL_HISTORY === '1';
       await command(input, ['variable', 'set', `APP_ORIGIN=${origin}`, `${redisNamespaceVariable(full)}=${record.sessionNamespace}`, 'PORT=8080',
-        ...serviceScoped(record), '--skip-deploys'], 'mutate', undefined, secrets);
+        ...(ephemeralMode ? ['FASTAGENT_EPHEMERAL_HISTORY=1'] : []), ...serviceScoped(record), '--skip-deploys'], 'mutate', undefined, secrets);
       const identities = { serviceId: resource(record, 'service'), environmentId: resource(record, 'environment') };
+      // Ephemeral history is process-local, so the service must stay at one replica. Railway already
+      // runs one replica per service by default; this pins numReplicas=1 explicitly and the confirmation
+      // below refuses to proceed when the platform does not confirm the single-instance setting.
       const settings = { numReplicas: 1, healthcheckPath: '/healthz', healthcheckTimeout: 300 };
       const configured = await api(profile.identityInArgs
         ? 'mutation($serviceId:String!,$environmentId:String!,$input:ServiceInstanceUpdateInput!){serviceInstanceUpdate(serviceId:$serviceId,environmentId:$environmentId,input:$input)}'
         : 'mutation($input:ServiceInstanceUpdateInput!){serviceInstanceUpdate(input:$input)}',
       profile.identityInArgs ? { ...identities, input: settings } : { input: { ...identities, ...settings } }, input.signal);
-      if (configured.serviceInstanceUpdate !== true) throw failure('RAILWAY_API_FAILED');
+      if (configured.serviceInstanceUpdate !== true) {
+        if (ephemeralMode) throw new FastagentError('DEPLOYMENT_SINGLE_INSTANCE_REQUIRED',
+          'Ephemeral history needs exactly one instance, but Railway did not confirm numReplicas=1. Set a TLS REDIS_URL and retry, or resolve the service instance setting manually.');
+        throw failure('RAILWAY_API_FAILED');
+      }
       await save({ phase: 'secrets-configured', status: 'deploying', resources: record.resources.filter((entry) => entry.kind !== 'build') });
       const upload = object(json(await command(input, ['up', input.source.directory, '--path-as-root', ...scoped(record), '--detach', '--json'], 'mutate', undefined, secrets)));
       const deploymentId = id(upload.deploymentId);

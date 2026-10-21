@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { FastagentError } from '../../errors.js';
 import { createDeploymentRecord, deploymentKey, validateDeploymentRecord, type DeploymentRecord } from '../state.js';
 import { isApprovedDockerfile } from '../dockerfiles.js';
-import { redisNamespace, redisNamespaceVariable, runtimeSecretKeys, secretValue, validateCloudEnvironment, validateHttpsOrigin, validatePreflightEnvironment,
+import { isTokenRuntime, redisNamespace, redisNamespaceVariable, runtimeSecretKeys, secretValue, validateCloudEnvironment, validateHttpsOrigin, validatePreflightEnvironment,
   type DeploymentProvider, type DeployInput, type PreflightEnvironment, type ProviderContext } from '../types.js';
 
 const knownSecretKeys = ['FASTAGENT_PASSWORD_HASH', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'FASTAGENT_API_TOKEN', 'REDIS_URL'] as const;
@@ -47,22 +47,31 @@ export interface CloudRunOptions {
 
 /** Source/package scripts are trusted code, NOT a sandbox. Separate existing build/runtime
  * identities are mandatory; direct policy diagnostics cannot certify inherited/custom-role
- * secret isolation. Never grant the build identity app-secret access. max=1 is a cost default,
- * not a singleton guarantee. Secret versions/images/builds remain until separately cleaned up.
+ * secret isolation. Never grant the build identity app-secret access. max=1 is a cost default and
+ * caps each revision at one instance, not the service across a rollout: old and new revisions can
+ * briefly overlap, so it is only a best-effort single-instance pin for the explicit
+ * FASTAGENT_EPHEMERAL_HISTORY=1 opt-in, whose history is disposable. Secret versions/images/builds
+ * remain until separately cleaned up.
  * CLI contracts: https://docs.cloud.google.com/sdk/gcloud/reference/run/deploy
  * Predictable origin: https://docs.cloud.google.com/run/docs/triggering/https-request */
 export function createCloudRunProvider(options: CloudRunOptions): DeploymentProvider {
   const sa = /^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/;
-  if (!/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(options.project) || !/^[a-z]+-[a-z]+\d$/.test(options.region) ||
-      !/^[a-z](?:[a-z0-9-]*[a-z0-9])?$/.test(options.service) || options.service.length > 49 ||
-      !sa.test(options.runtimeServiceAccount) || !sa.test(options.buildServiceAccount) ||
-      options.runtimeServiceAccount === options.buildServiceAccount || !options.commandEnv || typeof options.health !== 'function' ||
-      Object.entries(options.commandEnv).some(([key, value]) => !['PATH', 'HOME', 'CLOUDSDK_CONFIG', 'CLOUDSDK_ACTIVE_CONFIG_NAME', 'TMPDIR'].includes(key) ||
-        typeof value !== 'string' || /[\x00-\x1f\x7f]/.test(value))) throw fail('CLOUDRUN_OPTIONS_INVALID');
+  // Name the invalid setting without echoing potentially sensitive user input.
+  const invalidOption = (message: string): never => { throw new FastagentError('CLOUDRUN_OPTIONS_INVALID', message); };
+  if (!/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(options.project)) invalidOption('--project must be 6–30 lowercase letters, digits, or hyphens, starting with a letter and ending with a letter or digit.');
+  if (!/^[a-z]+-[a-z]+\d$/.test(options.region)) invalidOption('--region must have a region ID format such as us-central1.');
+  if (!/^[a-z](?:[a-z0-9-]*[a-z0-9])?$/.test(options.service) || options.service.length > 49) invalidOption('Cloud Run service name (fastagent.yaml name) must be 1–49 lowercase letters, digits, or hyphens, starting with a letter and ending with a letter or digit.');
+  const accountFormat = 'must be a service-account email: ACCOUNT@PROJECT.iam.gserviceaccount.com; ACCOUNT and PROJECT must each be 6–30 lowercase letters, digits, or hyphens, starting with a letter and ending with a letter or digit.';
+  if (!sa.test(options.runtimeServiceAccount)) invalidOption(`--runtime-account ${accountFormat}`);
+  if (!sa.test(options.buildServiceAccount)) invalidOption(`--build-account ${accountFormat}`);
+  if (options.runtimeServiceAccount === options.buildServiceAccount) invalidOption('--build-account must differ from --runtime-account; supply two existing distinct service accounts.');
+  if (!options.commandEnv || Object.entries(options.commandEnv).some(([key, value]) => !['PATH', 'HOME', 'CLOUDSDK_CONFIG', 'CLOUDSDK_ACTIVE_CONFIG_NAME', 'TMPDIR'].includes(key) ||
+      typeof value !== 'string' || /[\x00-\x1f\x7f]/.test(value))) invalidOption('Cloud Run commandEnv must contain only PATH, HOME, CLOUDSDK_CONFIG, CLOUDSDK_ACTIVE_CONFIG_NAME, or TMPDIR string values without control characters.');
+  if (typeof options.health !== 'function') invalidOption('Cloud Run health must be a health transport function.');
   const interval = options.pollIntervalMs ?? 2000, deadline = options.deploymentTimeoutMs ?? 900_000;
   const requestTimeout = options.requestTimeoutMs ?? 30_000, logLines = options.logLines ?? 100;
   if (![interval, deadline, requestTimeout, logLines].every(Number.isSafeInteger) || interval < 1 || interval > 60_000 ||
-      deadline < 1 || deadline > 3_600_000 || requestTimeout < 1 || requestTimeout > 120_000 || logLines < 1 || logLines > 500) throw fail('CLOUDRUN_OPTIONS_INVALID');
+      deadline < 1 || deadline > 3_600_000 || requestTimeout < 1 || requestTimeout > 120_000 || logLines < 1 || logLines > 500) invalidOption('Cloud Run pollIntervalMs (1–60000), deploymentTimeoutMs (1–3600000), requestTimeoutMs (1–120000), and logLines (1–500) must be integers within their ranges.');
   const projectArgs = ['--project', options.project];
   const buildAccountProject = options.buildServiceAccount.split('@')[1]!.split('.iam.')[0]!;
   const buildAccountId = `projects/${buildAccountProject}/serviceAccounts/${options.buildServiceAccount}`;
@@ -218,11 +227,16 @@ export function createCloudRunProvider(options: CloudRunOptions): DeploymentProv
     if (token) {
       const modelKeys = ['OPENAI_API_KEY', 'OPENROUTER_API_KEY'].filter((key) => names.includes(key));
       if (modelKeys.length !== 1 || names.includes('FASTAGENT_SESSION_NAMESPACE')) throw fail('CLOUDRUN_UNSAFE_REMOTE_ENV');
-      const secrets = ['FASTAGENT_API_TOKEN', modelKeys[0]!, 'REDIS_URL'];
-      return { secrets, namespace: 'FASTAGENT_HISTORY_NAMESPACE', allowed: [...secrets, 'APP_ORIGIN', 'FASTAGENT_HISTORY_NAMESPACE', 'PORT'] };
+      const redis = names.includes('REDIS_URL');
+      const ephemeral = names.includes('FASTAGENT_EPHEMERAL_HISTORY');
+      // Exactly one history backend must be live on the revision, matching local preflight.
+      if (redis === ephemeral) throw fail('CLOUDRUN_UNSAFE_REMOTE_ENV');
+      const secrets = ['FASTAGENT_API_TOKEN', modelKeys[0]!, ...(redis ? ['REDIS_URL'] : [])];
+      return { secrets, namespace: 'FASTAGENT_HISTORY_NAMESPACE', ephemeral,
+        allowed: [...secrets, 'APP_ORIGIN', 'FASTAGENT_HISTORY_NAMESPACE', 'PORT', ...(ephemeral ? ['FASTAGENT_EPHEMERAL_HISTORY'] : [])] };
     }
     const secrets = ['FASTAGENT_PASSWORD_HASH', 'OPENAI_API_KEY', 'REDIS_URL'];
-    return { secrets, namespace: 'FASTAGENT_SESSION_NAMESPACE', allowed: [...secrets, 'APP_ORIGIN', 'FASTAGENT_SESSION_NAMESPACE', 'PORT'] };
+    return { secrets, namespace: 'FASTAGENT_SESSION_NAMESPACE', ephemeral: false, allowed: [...secrets, 'APP_ORIGIN', 'FASTAGENT_SESSION_NAMESPACE', 'PORT'] };
   }
   function config(remote: Record<string, unknown>, record: DeploymentRecord, checkOrigin = true) {
     ownedService(remote, record);
@@ -241,6 +255,10 @@ export function createCloudRunProvider(options: CloudRunOptions): DeploymentProv
     const value = (key: string) => env.find((e) => e.name === key);
     if (value('APP_ORIGIN')?.value !== record.url || value(contract.namespace)?.value !== record.sessionNamespace ||
         (value('PORT') && value('PORT')?.value !== '8080') || list(container.ports).length !== 1 || obj(list(container.ports)[0]).containerPort !== 8080) throw fail('CLOUDRUN_CONFIG_MISMATCH');
+    if (contract.ephemeral) {
+      const entry = value('FASTAGENT_EPHEMERAL_HISTORY');
+      if (!entry || entry.value !== '1' || 'valueFrom' in entry) throw fail('CLOUDRUN_CONFIG_MISMATCH');
+    }
     for (const key of contract.secrets) {
       const entry = value(key);
       if (!entry || 'value' in entry) throw fail('CLOUDRUN_UNSAFE_REMOTE_ENV');
@@ -373,10 +391,15 @@ export function createCloudRunProvider(options: CloudRunOptions): DeploymentProv
     }
     async function upload(selectedOrigin: string, update: boolean) {
       const references = runtimeSecretKeys(environment).map((key) => `${key}=${secretId(record!, key).split('/').at(-1)}:${version(record!, key)}`).join(',');
+      // Ephemeral mode injects no REDIS_URL; it pins max-instances=1 so the in-memory single-instance
+      // assumption holds (max=1 is otherwise a cost default, not a singleton guarantee).
+      const ephemeralMode = isTokenRuntime(environment) && environment.FASTAGENT_EPHEMERAL_HISTORY === '1';
+      const envVars = [`APP_ORIGIN=${selectedOrigin}`, `${redisNamespaceVariable(environment)}=${record!.sessionNamespace}`,
+        ...(ephemeralMode ? ['FASTAGENT_EPHEMERAL_HISTORY=1'] : [])].join(',');
       const response = obj(parse(await command(input, ['run', 'deploy', options.service, '--region', options.region, '--source', input.source.directory,
         '--service-account', options.runtimeServiceAccount, '--build-service-account', buildAccountId,
         '--port=8080', '--max=1', '--max-instances=1', '--timeout=300', '--concurrency=20',
-        '--set-env-vars', `APP_ORIGIN=${selectedOrigin},${redisNamespaceVariable(environment)}=${record!.sessionNamespace}`,
+        '--set-env-vars', envVars,
         '--set-secrets', references, '--labels', `${ownerLabel}=${record!.ownershipMarker}`, '--invoker-iam-check', '--deploy-health-check',
         ...(update ? ['--no-traffic'] : ['--no-allow-unauthenticated']), '--quiet', '--format=json'], 'mutate', undefined, input.selector.projectPath, remaining())));
       ownedService(response, record!);

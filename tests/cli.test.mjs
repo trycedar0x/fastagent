@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
-import { readFile, readdir } from 'node:fs/promises';
+import { readFile, readdir, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { temporaryDirectory } from './helpers.mjs';
 
@@ -28,6 +29,7 @@ test('CLI: version and help work in text and JSON modes', async () => {
     const result = cli(args);
     assert.equal(result.status, 0);
     assert.match(result.stdout, /fastagent init <directory>/);
+    assert.ok(result.stdout.includes('fastagent dev [directory] [--install] [--json]'));
     assert.match(result.stdout, /init and dev are implemented/);
   }
   assert.equal(jsonResult(cli(['--help', '--json']), 0).command, 'help');
@@ -71,12 +73,47 @@ test('CLI: JSON errors, argument failures and unsupported frameworks are honest 
   assert.deepEqual(await readdir(cwd), []);
 });
 
+test('CLI: init writes an ignored token but never prints it', async (t) => {
+  const cwd = await temporaryDirectory(t);
+  const result = cli(['init', 'agent', '--json'], cwd);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  const token = (await readFile(join(cwd, 'agent', '.env.auth'), 'utf8')).trim().slice('FASTAGENT_API_TOKEN='.length);
+  assert.match(token, /^[A-Za-z0-9_-]{43}$/);
+  assert.ok(!result.stdout.includes(token));
+  assert.ok(!result.stderr.includes(token));
+});
+
+test('CLI: chat never reads stdin implicitly and fails fast when no message is given', async (t) => {
+  const cwd = await temporaryDirectory(t);
+  await writeFile(join(cwd, '.env.auth'), `FASTAGENT_API_TOKEN=${'a'.repeat(43)}\n`);
+  // stdin is an open pipe that is never closed: an implicit read would block forever.
+  const child = spawn(process.execPath, [cliPath, 'chat', '--url', 'https://example.invalid', '--env-file', '.env.auth', '--json'], {
+    cwd, stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); });
+  let stdout = '', stderr = '';
+  child.stdout.on('data', (chunk) => { stdout += chunk; });
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  const started = Date.now();
+  const closed = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('chat hung waiting on stdin')), 5000);
+    child.once('close', (code, signal) => { clearTimeout(timer); resolve({ code, signal }); });
+  });
+  assert.ok(Date.now() - started < 5000, 'chat must not wait on stdin');
+  assert.equal(closed.code, 2, stdout + stderr); assert.equal(closed.signal, null); assert.equal(stderr, '');
+  assert.equal(JSON.parse(stdout).error.code, 'INVALID_ARGUMENTS');
+  // Explicit --stdin (closed immediately) reads the pipe and reports an input error instead of hanging.
+  const explicit = spawnSync(process.execPath, [cliPath, 'chat', '--url', 'https://example.invalid', '--env-file', '.env.auth', '--stdin', '--json'], { cwd, encoding: 'utf8', input: '', timeout: 5000 });
+  assert.equal(explicit.status, 2, explicit.stdout + explicit.stderr);
+  assert.equal(JSON.parse(explicit.stdout).error.code, 'CHAT_INPUT_INVALID');
+});
+
 test('CLI: text init identifies runnable runtime and text errors use stderr', async (t) => {
   const cwd = await temporaryDirectory(t);
   const result = cli(['init', 'agent'], cwd);
   assert.equal(result.status, 0);
   assert.equal(result.stderr, '');
-  assert.match(result.stdout, /Runnable headless chat template/);
+  assert.match(result.stdout, /Generated an ignored .env.auth with a random bearer token/);
   const failure = cli(['init', 'agent'], cwd);
   assert.equal(failure.status, 1);
   assert.equal(failure.stdout, '');

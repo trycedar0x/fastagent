@@ -290,8 +290,15 @@ test('runtime/config: provider-key selection, exact default, token YAML and stab
   for (const [reference, matching, wrong] of [[defaultModel, 'OPENROUTER_API_KEY', 'OPENAI_API_KEY'], ['openai/gpt-4o-mini', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY']]) {
     await writeFile(join(directory, 'fastagent.yaml'), yaml(reference));
     for (const [env, configured] of [[{ [wrong]: 'synthetic-wrong-key' }, false], [{ [matching]: 'synthetic-matching-key' }, true]]) {
-      const result = load(env); assert.equal(result.status, 0, result.stderr);
-      assert.deepEqual(JSON.parse(result.stdout), { configured, namespace: 'runtime-app' });
+      const result = load(env);
+      if (!configured) {
+        assert.equal(result.status, 1);
+        assert.ok(result.stderr.includes(`${matching} is required`));
+        assert.ok(!result.stderr.includes('synthetic-wrong-key'));
+      } else {
+        assert.equal(result.status, 0, result.stderr);
+        assert.deepEqual(JSON.parse(result.stdout), { configured, namespace: 'runtime-app' });
+      }
     }
   }
   await writeFile(join(directory, 'fastagent.yaml'), yaml(null));
@@ -307,6 +314,70 @@ test('runtime/config: provider-key selection, exact default, token YAML and stab
   config.validateRuntimeConfig(valid);
   for (const origin of ['', 'http://chat.example', 'https://chat.example/', 'https://user:secret@chat.example', 'https://chat.example/path']) assert.throws(() => config.validateRuntimeConfig({ ...valid, origin }));
   assert.throws(() => config.validateRuntimeConfig({ ...valid, apiToken: '' }), { message: 'Invalid bearer token configuration.' });
+});
+
+test('runtime/startup: missing or blank matching model keys fail before readiness without network calls', async () => {
+  for (const [model, matching, wrong] of [[defaultModel, 'OPENROUTER_API_KEY', 'OPENAI_API_KEY'], ['openai/gpt-4o-mini', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY']]) {
+    await writeFile(join(directory, 'fastagent.yaml'), `schemaVersion: 1\nname: runtime-app\nframework: openai\nmodel: ${model}\ndeployment:\n  access: token\n`);
+    for (const mode of ['local', 'production']) {
+      for (const key of [undefined, '', '   ']) {
+        const env = { FASTAGENT_API_TOKEN: apiToken, [wrong]: 'synthetic-wrong-key',
+          ...(mode === 'local' ? { FASTAGENT_LOCAL_DEV: '1', FASTAGENT_DEV_JSON: '1' } : { APP_ORIGIN: 'https://chat.example', FASTAGENT_EPHEMERAL_HISTORY: '1' }),
+          ...(key === undefined ? {} : { [matching]: key }) };
+        const result = spawnSync(process.execPath, ['dist/main.js'], { cwd: directory, encoding: 'utf8', env, timeout: 5000 });
+        assert.equal(result.status, 1, result.stderr);
+        assert.ok(!result.stdout.includes('"ok":true'));
+        assert.ok(!(result.stdout + result.stderr).includes('synthetic-wrong-key'));
+        assert.ok(!(result.stdout + result.stderr).includes(apiToken));
+        if (mode === 'local') {
+          const failure = JSON.parse(result.stdout);
+          assert.equal(failure.error.code, 'MODEL_API_KEY_MISSING');
+          assert.ok(failure.error.message.includes(`${matching} is required`));
+          assert.equal(result.stderr, '');
+        } else {
+          assert.equal(result.stdout, '');
+          assert.ok(result.stderr.includes(`${matching} is required`));
+        }
+      }
+    }
+  }
+});
+
+test('runtime/config: ephemeral history is explicit, exclusive, and rejected in local dev', async () => {
+  const base = { origin: 'https://chat.example', localDev: false, apiToken, model: undefined, historyNamespace: 'stable-app' };
+  config.validateRuntimeConfig({ ...base, ephemeralHistory: true });
+  config.validateRuntimeConfig({ ...base, redisUrl: 'rediss://redis.example/0' });
+  assert.throws(() => config.validateRuntimeConfig({ ...base, ephemeralHistory: true, redisUrl: 'rediss://redis.example/0' }), { message: config.EPHEMERAL_HISTORY_CONFLICT_ERROR });
+  assert.throws(() => config.validateRuntimeConfig(base), { message: 'REDIS_URL must configure Redis with TLS in production.' });
+  assert.throws(() => config.validateRuntimeConfig({ ...base, localDev: true, origin: 'http://localhost:3000', ephemeralHistory: true }), { message: config.EPHEMERAL_HISTORY_LOCAL_ERROR });
+
+  await writeFile(join(directory, 'fastagent.yaml'), `schemaVersion: 1\nname: runtime-app\nframework: openai\nmodel: ${defaultModel}\ndeployment:\n  access: token\n`);
+  const run = (env) => spawnSync(process.execPath, ['--input-type=module', '-e',
+    `import {loadRuntimeConfig} from './dist/config.js'; try { const c = await loadRuntimeConfig(process.env); console.log(JSON.stringify({ephemeral:c.ephemeralHistory, redis:!!c.redisUrl})); } catch (e) { console.error(e.message); process.exitCode = 1; }`,
+  ], { cwd: directory, encoding: 'utf8', env });
+  const production = { FASTAGENT_API_TOKEN: apiToken, APP_ORIGIN: 'https://chat.example', OPENROUTER_API_KEY: 'synthetic-key' };
+  let result = run({ ...production, FASTAGENT_EPHEMERAL_HISTORY: '1' });
+  assert.equal(result.status, 0, result.stderr); assert.deepEqual(JSON.parse(result.stdout), { ephemeral: true, redis: false });
+  result = run({ ...production, REDIS_URL: 'rediss://redis.example/0' });
+  assert.equal(result.status, 0, result.stderr); assert.deepEqual(JSON.parse(result.stdout), { ephemeral: false, redis: true });
+  result = run({ ...production, FASTAGENT_EPHEMERAL_HISTORY: 'true' });
+  assert.equal(result.status, 1); assert.equal(result.stderr, config.EPHEMERAL_HISTORY_VALUE_ERROR + '\n');
+  result = run({ ...production, FASTAGENT_EPHEMERAL_HISTORY: '1', REDIS_URL: 'rediss://redis.example/0' });
+  assert.equal(result.status, 1); assert.equal(result.stderr, config.EPHEMERAL_HISTORY_CONFLICT_ERROR + '\n');
+  result = run(production);
+  assert.equal(result.status, 1); assert.equal(result.stderr, 'REDIS_URL must configure Redis with TLS in production.\n');
+});
+
+test('runtime/config: ephemeral production runtime warns once and serves public health from memory', async (t) => {
+  const writes = [];
+  const original = process.stderr.write.bind(process.stderr);
+  t.mock.method(process.stderr, 'write', (chunk, ...rest) => { writes.push(String(chunk)); return original(chunk, ...rest); });
+  const store = history.createMemoryHistoryStore();
+  const app = await runtime(t, mockModel(), store, { localDev: false, origin: 'https://chat.example', ephemeralHistory: true, historyNamespace: 'stable-app' });
+  const warnings = writes.filter((line) => line.includes('FASTAGENT_EPHEMERAL_HISTORY'));
+  assert.equal(warnings.length, 1); assert.match(warnings[0], /in memory/); assert.match(warnings[0], /lost on every restart/);
+  const response = await fetch(app.base + '/healthz');
+  assert.equal(response.status, 200); assert.deepEqual(await response.json(), { ok: true });
 });
 
 // Reads NDJSON frames incrementally so a test can act between frames: returns the first

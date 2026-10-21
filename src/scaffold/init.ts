@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { lstat, mkdir, rmdir, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, parse, resolve } from 'node:path';
 import { createConfig } from '../config/config.js';
@@ -18,6 +19,10 @@ export interface InitResult {
   scaffoldStage: 'runnable';
   files: string[];
 }
+
+// Generated at init time, never a template asset: the token is per-project and must not ship in a package.
+const AUTH_FILE = '.env.auth';
+const API_TOKEN_BYTES = 32;
 
 function hasCode(error: unknown, code: string): boolean {
   return typeof error === 'object' && error !== null && 'code' in error && error.code === code;
@@ -107,6 +112,10 @@ export async function initProject(options: InitOptions): Promise<InitResult> {
       await writeFile(resolve(directory, file.path), file.content, { flag: 'wx', mode: 0o644 });
       written.push(file.path);
     }
+    // Owner-only bearer token; base64url of 32 random bytes. The value is never returned or logged.
+    const apiToken = randomBytes(API_TOKEN_BYTES).toString('base64url');
+    await writeFile(resolve(directory, AUTH_FILE), `FASTAGENT_API_TOKEN=${apiToken}\n`, { flag: 'wx', mode: 0o600 });
+    written.push(AUTH_FILE);
   } catch {
     // Never recursively remove a destination that may contain somebody else's files.
     for (const file of written.reverse()) {
@@ -124,7 +133,7 @@ export async function initProject(options: InitOptions): Promise<InitResult> {
     name: config.name,
     framework: config.framework,
     scaffoldStage: openaiTemplate.stage,
-    files: files.map((file) => file.path),
+    files: [...files.map((file) => file.path), AUTH_FILE],
   };
 }
 

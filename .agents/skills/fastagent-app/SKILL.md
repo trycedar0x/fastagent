@@ -32,7 +32,7 @@ In the CLI repository, adding a template asset also requires adding it to the ma
 - Do not disclose reasoning content. Empty, whitespace-only, and reasoning-only completions are generic failures.
 - Keep the scoped SSE guard that rejects `thread.*` events before the SDK logs them.
 - Plain HTTP is explicit localhost development only.
-- Production requires user-supplied TLS Redis for conversation history. Never fall back to memory on outage or log its URL.
+- Production requires user-supplied TLS Redis for conversation history, unless the deployment explicitly opts into single-instance in-memory history with `FASTAGENT_EPHEMERAL_HISTORY=1`. That opt-in is the literal `1`, is refused together with `REDIS_URL` or in local development, and must not weaken the fail-closed default: never fall back to memory on a Redis outage or log the Redis URL. Emit one startup warning that history is in memory and lost on restart, and never log the token.
 - Keep the app's history namespace stable across versions and distinct from other apps.
 - Do not add native iMessage integration. A separate Mac-side bridge may call this API; cloud hosts cannot access Apple Messages.
 

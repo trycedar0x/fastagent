@@ -8,7 +8,7 @@ Fastagent has two parts: a local CLI and a generated headless chat app. The CLI 
 
 [Editable Excalidraw source](diagrams/architecture.excalidraw)
 
-The generated app can build and run without the CLI package. It serves the chat API directly and connects to a user-supplied TLS Redis for production history; local development may use in-memory history instead, and the app never runs a history store of its own. It has no browser UI. GitHub is not required.
+The generated app can build and run without the CLI package. It serves the chat API directly and connects to a user-supplied TLS Redis for production history; local development uses in-memory history, and production may use in-memory history only through the explicit single-instance `FASTAGENT_EPHEMERAL_HISTORY=1` opt-in. The app never runs a history service of its own. It has no browser UI. GitHub is not required.
 
 ## Code layout
 
@@ -16,7 +16,7 @@ The generated app can build and run without the CLI package. It serves the chat 
 | --- | --- |
 | `src/cli.ts` | Arguments, output, and exit codes |
 | `src/config/` | Validate project configuration |
-| `src/scaffold/` | Render the local template; create files without overwriting |
+| `src/scaffold/` | Render the local template; create files without overwriting, and generate an ignored owner-only `.env.auth` bearer token |
 | `src/dev/` | Build and start localhost development |
 | `src/models/` | Public OpenRouter catalog metadata and model reference grammar |
 | `src/chat/` | Headless chat client used by `fastagent chat` |
@@ -63,11 +63,11 @@ Production listens on `0.0.0.0` and the platform's `PORT`. Explicit local develo
 
 One bearer token authorizes every conversation for the app. There is no per-visitor identity, cookie, CSRF token, or browser password UI. Requests must present exactly one `Authorization: Bearer` field; query tokens, cookies, and duplicate credential fields are rejected. If a client sends `Origin`, it must match `APP_ORIGIN` exactly; machine clients may omit it.
 
-Production uses user-supplied TLS Redis, which stores conversation history rather than login sessions. A completed turn is stored for seven days from the successful commit. An app holds at most 1000 conversations; a new conversation is rejected at capacity. A conversation holds at most 40 messages and 256 KiB of serialized UTF-8, trimming oldest whole turns. A generation lease lasts 45 seconds against the 30-second request limit. Commit, release, and delete check lease ownership atomically. A failed or aborted request stores no turn, does not extend retention, and releases its reservation: an aborted request never starts a commit. A commit that has already started is atomic and uncancellable, and a successful commit ends lease ownership, so an abort landing in that sub-atomic window can still store the completed turn; the response then reports the committed turn rather than claiming a failure for stored history. Closing that window would require an atomic rollback operation that restores the previous messages and their original expiry. Missing or expired reads and deletes return 404, an active delete returns 409, and capacity exhaustion returns 429.
+Production uses user-supplied TLS Redis, which stores conversation history rather than login sessions. Redis is required unless the deployment explicitly opts into single-instance in-memory history with `FASTAGENT_EPHEMERAL_HISTORY=1`; that is safe only when the platform pins one instance and history is intentionally lost on restart. A completed turn is stored for seven days from the successful commit. An app holds at most 1000 conversations; a new conversation is rejected at capacity. A conversation holds at most 40 messages and 256 KiB of serialized UTF-8, trimming oldest whole turns. A generation lease lasts 45 seconds against the 30-second request limit. Commit, release, and delete check lease ownership atomically. A failed or aborted request stores no turn, does not extend retention, and releases its reservation: an aborted request never starts a commit. A commit that has already started is atomic and uncancellable, and a successful commit ends lease ownership, so an abort landing in that sub-atomic window can still store the completed turn; the response then reports the committed turn rather than claiming a failure for stored history. Closing that window would require an atomic rollback operation that restores the previous messages and their original expiry. Missing or expired reads and deletes return 404, an active delete returns 409, and capacity exhaustion returns 429.
 
 Model context is independently bounded, regardless of stored history: the complete request sent to the model is at most 20 messages and 16,000 characters including the system prompt and tool turns. Older whole turns are dropped to fit, and a request that cannot fit fails generically without calling the model.
 
-Local development may use memory. Production never falls back to memory during a Redis outage. Startup and store requests are bounded; outages return generic 503 errors and native reconnect restores service.
+Local development may use memory. Production uses memory only through the explicit `FASTAGENT_EPHEMERAL_HISTORY=1` opt-in (accepted as the literal `1`, refused together with Redis or local development) and never falls back to memory during a Redis outage. The two history backends are mutually exclusive: neither or both is a startup configuration error. Startup and store requests are bounded; outages return generic 503 errors and native reconnect restores service.
 
 All versions of an app share its namespace. Different apps must use different namespaces. Changing the bearer token does not revoke stored history; use a different namespace to isolate a different app, and keep the namespace stable across versions.
 
@@ -79,7 +79,7 @@ These are per-instance throttles, not a distributed abuse-protection layer or ha
 
 ## Secret boundaries
 
-For a newly generated app, runtime secrets are the bearer token (`FASTAGENT_API_TOKEN`), the model key selected by the model reference (`OPENROUTER_API_KEY` or `OPENAI_API_KEY`), and the Redis URL. A legacy `access: protected` app instead uses the password hash (`FASTAGENT_PASSWORD_HASH`) and its session namespace (`FASTAGENT_SESSION_NAMESPACE`) plus the OpenAI key, and it needs no bearer token. The CLI selects the required key set from `deployment.access`, so a protected app keeps its existing password secrets. It reads only explicitly selected secret files. Do not put values in command arguments, configuration, state, logs, uploads, images, or client code.
+For a newly generated app, runtime secrets are the bearer token (`FASTAGENT_API_TOKEN`), the model key selected by the model reference (`OPENROUTER_API_KEY` or `OPENAI_API_KEY`), and either the Redis URL or the non-secret `FASTAGENT_EPHEMERAL_HISTORY=1` flag. The CLI injects exactly one history backend: in ephemeral mode it creates no Redis secret and injects the flag as a non-secret environment variable instead. A legacy `access: protected` app instead uses the password hash (`FASTAGENT_PASSWORD_HASH`) and its session namespace (`FASTAGENT_SESSION_NAMESPACE`) plus the OpenAI key, and it needs no bearer token. The CLI selects the required key set from `deployment.access`, so a protected app keeps its existing password secrets. It reads only explicitly selected secret files. Do not put values in command arguments, configuration, state, logs, uploads, images, or client code.
 
 Builds must work without model or Redis credentials. The upload uses an allowlisted temporary directory, rejects symlinks, and excludes environment files and common credential paths. Deployment currently accepts only the bundled Dockerfile.
 
@@ -104,6 +104,8 @@ A queued build is not a successful deployment. Unknown mutation outcomes require
 
 Use the official CLI for creation, variables via stdin, source upload, deployment polling, and logs. A bounded API transport handles ownership/configuration/deletion where needed.
 
+Railway runs one replica per service by default; the adapter pins `numReplicas=1` explicitly and refuses to continue in ephemeral mode if the platform does not confirm that single-instance setting. Replica count is still a per-revision cost default: rollout overlap can briefly exceed one process, so shared Redis remains the safe default.
+
 Acquire the domain before app activation. Account credentials are required for initial creation and deletion; environment-scoped tokens only reuse recorded targets. Delete the verified service, never the whole project.
 
 ### Cloud Run
@@ -112,7 +114,7 @@ Use `gcloud` with an explicit project, region, and existing runtime/build servic
 
 Create app-owned secrets, pin confirmed versions, and grant the runtime account access. Keep the initial deployment private until its real HTTPS origin is verified. Route traffic to one selected revision without tags or traffic splits.
 
-Instance caps are cost defaults, not strict singleton guarantees. Shared Redis makes history work across rollout overlap. IAM diagnostics are not complete proof of effective inherited/custom-role permissions.
+Instance caps are cost defaults, not general singleton guarantees. Cloud Run sets `--max-instances=1` and the adapter verifies `maxScale=1`; that bounds each revision to one instance, but a deployment rollout can briefly overlap the old and new revisions, so ephemeral in-memory history can split across those processes. The ephemeral opt-in accepts that residual and treats history as disposable; shared Redis is what makes history correct across rollout overlap. IAM diagnostics are not complete proof of effective inherited/custom-role permissions.
 
 Deletion verifies the service and owned secrets. Projects, accounts, shared registries, images, and build history may remain.
 

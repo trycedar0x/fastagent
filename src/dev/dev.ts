@@ -27,7 +27,7 @@ function run(command: string, args: string[], cwd: string, env: NodeJS.ProcessEn
   });
 }
 
-export async function devProject(options: { directory?: string; install?: boolean; cwd?: string }): Promise<number> {
+export async function devProject(options: { directory?: string; install?: boolean; cwd?: string; json?: boolean }): Promise<number> {
   const directory = resolve(options.cwd ?? process.cwd(), options.directory ?? '.');
   try {
     parseConfig(await readFile(resolve(directory, 'fastagent.yaml'), 'utf8'));
@@ -53,5 +53,6 @@ export async function devProject(options: { directory?: string; install?: boolea
   return run(process.execPath, ['--env-file-if-exists=.env', '--env-file-if-exists=.env.auth', 'dist/main.js'], directory, {
     ...process.env,
     FASTAGENT_LOCAL_DEV: '1',
+    ...(options.json ? { FASTAGENT_DEV_JSON: '1' } : {}),
   });
 }

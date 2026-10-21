@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, writeFile, readdir, access, mkdir, symlink } from 'node:fs/promises';
+import { readFile, writeFile, readdir, access, mkdir, rm, symlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { spawnSync, spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -148,6 +148,27 @@ test('deployment cancellation preserves checkpoints and cleanup; namespaces and 
   assert.equal((await saved(f)).ownershipMarker, initial.ownershipMarker);
 });
 
+test('deployment env auto-detect follows .env then .env.auth, excludes .env.example, and reports nothing found', async (t) => {
+  const f = await fixture(t);
+  // Only .env.auth present: auto-detect must not invent the model key or Redis from ambient files.
+  await writeFile(join(f.cwd, '.env.example'), 'OPENROUTER_API_KEY=placeholder-only\n');
+  await writeFile(join(f.cwd, '.env'), 'OPENROUTER_API_KEY=synthetic-auto-model-key\nREDIS_URL=rediss://user:synthetic-auto-redis@redis.invalid/0\n');
+  const result = await executeDeployment({ ...f.options, envFiles: undefined, dryRun: true }, f.deps);
+  assert.equal(result.dryRun, true);
+  assert.ok(result.secretKeys.includes('OPENROUTER_API_KEY'));
+  assert.ok(!result.secretKeys.includes('placeholder-only'));
+  // .env.example is never a runtime secret file even when it is the only candidate.
+  const emptyRoot = await temporaryDirectory(t);
+  const empty = (await initProject({ directory: 'agent', cwd: emptyRoot })).directory;
+  // Remove the generated .env.auth so only .env.example remains; auto-detect must find nothing.
+  await rm(join(empty, '.env.auth'));
+  await writeFile(join(empty, '.env.example'), 'OPENROUTER_API_KEY=placeholder-only\nFASTAGENT_API_TOKEN=placeholder\n');
+  await assert.rejects(executeDeployment({ ...f.options, cwd: empty, authFile: undefined, envFiles: undefined, dryRun: true }, f.deps), code('DEPLOYMENT_ENV_FILE_MISSING'));
+  // The auto-detected order is .env then .env.auth; explicit flags still win and are used verbatim.
+  const explicit = await executeDeployment({ ...f.options, envFiles: ['.env.auth'], dryRun: true }, f.deps).catch((error) => error);
+  assert.equal(explicit.code, 'DEPLOYMENT_ENV_INVALID');
+});
+
 test('explicit env helper rejects unknown/local/malformed secrets, unsafe paths, duplicate keys and invalid hash/TLS Redis', async (t) => {
   const f = await fixture(t);
   for (const source of ['UNKNOWN_SECRET=hidden-value', 'FASTAGENT_LOCAL_DEV=1', 'OPENROUTER_API_KEY="unterminated', 'not an assignment', 'OPENROUTER_API_KEY=one\nOPENROUTER_API_KEY=two']) {
@@ -170,7 +191,15 @@ test('deployment CLI JSON and text dry run use explicit current directory and re
   const result = JSON.parse(output.stdout); assert.equal(result.ok, true); assert.equal(result.dryRun, true); assert.equal(result.target, 'agent');
   for (const secret of [...Object.values(secrets), token, 'ambient-must-not-load', 'ambient-token']) assert.ok(!output.stdout.includes(secret));
   assert.match(invoke(args, f.cwd, f.root).stdout, /Dry run: railway\/agent/);
-  assert.equal(invoke(['deploy', '--provider', 'railway', '--workspace', 'workspace-test', '--dry-run', '--json'], f.cwd, f.root, secrets).status, 1);
+  // With no --env-file, the CLI auto-detects .env then .env.auth in the app directory; the ambient
+  // shell secrets are still ignored.
+  const auto = invoke(['deploy', '--provider', 'railway', '--workspace', 'workspace-test', '--dry-run', '--json'], f.cwd, f.root, secrets);
+  assert.equal(auto.status, 0, auto.stdout + auto.stderr); assert.equal(auto.stderr, '');
+  const autoResult = JSON.parse(auto.stdout);
+  assert.equal(autoResult.dryRun, true); assert.equal(autoResult.target, 'agent');
+  assert.ok(autoResult.secretKeys.includes('FASTAGENT_API_TOKEN'));
+  assert.ok(autoResult.secretKeys.includes('OPENROUTER_API_KEY'));
+  for (const secret of [...Object.values(secrets), token, 'ambient-must-not-load']) assert.ok(!auto.stdout.includes(secret));
   for (const args of [
     ['deploy', f.cwd, '--provider', 'railway'], ['status', '--provider', 'railway', '--env-file', '.env'],
     ['deploy', '--provider', 'other'], ['init', 'other-agent', '--provider', 'railway'],
@@ -210,6 +239,19 @@ test('deployment CLI SIGINT/SIGTERM cancel a bounded fake native command and pre
     try { assert.equal((await lock.read()).status, 'pending'); } finally { await lock.release(); }
     assert.ok((await readdir(defaultStore.directory)).every((file) => !file.endsWith('.lock')));
   }
+});
+
+test('deployment CLI JSON emits stable codes for history-backend and env auto-detect failures', async (t) => {
+  const f = await fixture(t);
+  const base = ['deploy', '--provider', 'railway', '--workspace', 'workspace-test', '--dry-run', '--json'];
+  const runJson = (cwd) => { const out = invoke(base, cwd, f.root); assert.equal(out.stderr, ''); return JSON.parse(out.stdout); };
+  await writeFile(join(f.cwd, '.env'), 'OPENROUTER_API_KEY=synthetic-key\nREDIS_URL=rediss://user:synthetic@redis.invalid/0\nFASTAGENT_EPHEMERAL_HISTORY=1\n');
+  assert.equal(runJson(f.cwd).error.code, 'DEPLOYMENT_HISTORY_BACKEND_CONFLICT');
+  await writeFile(join(f.cwd, '.env'), 'OPENROUTER_API_KEY=synthetic-key\n');
+  assert.equal(runJson(f.cwd).error.code, 'DEPLOYMENT_HISTORY_BACKEND_MISSING');
+  const bare = await temporaryDirectory(t);
+  await writeFile(join(bare, 'fastagent.yaml'), await readFile(join(f.cwd, 'fastagent.yaml')));
+  assert.equal(runJson(bare).error.code, 'DEPLOYMENT_ENV_FILE_MISSING');
 });
 
 test('login is honest, no credential reads; native browser flow requires opt-in, selective configuration environment', async (t) => {

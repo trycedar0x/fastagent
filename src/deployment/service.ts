@@ -8,7 +8,7 @@ import { interactiveCloudLogin } from './login.js';
 import { createProcessRunner, redactProcessOutput, type ProcessRunner } from './process.js';
 import { createCloudRunProvider } from './providers/cloudrun.js';
 import { createRailwayProvider } from './providers/railway.js';
-import { loadExplicitSecrets } from './secrets.js';
+import { detectRuntimeEnvFiles, loadExplicitSecrets } from './secrets.js';
 import { stageDeploymentSource, type StagedSource } from './staging.js';
 import { createDeploymentRecord, DeploymentStore, type DeploymentLock, type DeploymentRecord } from './state.js';
 import { validatePreflightEnvironment, type DeploymentProvider, type ProviderName } from './types.js';
@@ -47,7 +47,7 @@ const invalid = () => new FastagentError('INVALID_ARGUMENTS', 'Invalid deploymen
 const namespaceKeys = ['APP_ORIGIN', 'FASTAGENT_SESSION_NAMESPACE', 'FASTAGENT_HISTORY_NAMESPACE'];
 function runtimeKeysFor(config: ProjectConfig): string[] {
   if (config.deployment.access === 'protected') return ['FASTAGENT_PASSWORD_HASH', 'OPENAI_API_KEY', 'REDIS_URL', 'APP_ORIGIN', 'FASTAGENT_SESSION_NAMESPACE'];
-  return ['FASTAGENT_API_TOKEN', modelApiKeyName(config.model), 'REDIS_URL', 'APP_ORIGIN', 'FASTAGENT_HISTORY_NAMESPACE'];
+  return ['FASTAGENT_API_TOKEN', modelApiKeyName(config.model), 'REDIS_URL', 'FASTAGENT_EPHEMERAL_HISTORY', 'APP_ORIGIN', 'FASTAGENT_HISTORY_NAMESPACE'];
 }
 
 /** Select only native CLI configuration, never model credentials or arbitrary ambient variables. */
@@ -110,7 +110,12 @@ export async function executeDeployment(options: DeploymentOptions, dependencies
     let result: Record<string, unknown>;
     if (command === 'deploy') {
       if (record?.status === 'destroying') throw new FastagentError('DEPLOYMENT_DESTROY_PENDING', 'Target destruction is pending; finish or inspect destruction before deploying.');
-      const environment = await loadExplicitSecrets(options.envFiles ?? [], cwd, runtimeKeysFor(config), sensitive);
+      // Explicit --env-file flags always win. Otherwise auto-detect only the conventional ignored
+      // files; a missing pair fails clearly instead of deploying with partial secrets.
+      const envFiles = options.envFiles ?? await detectRuntimeEnvFiles(cwd);
+      if (options.envFiles === undefined && envFiles.length === 0) throw new FastagentError('DEPLOYMENT_ENV_FILE_MISSING',
+        'No runtime env files found. Create an ignored .env (model key plus either a TLS rediss:// REDIS_URL or FASTAGENT_EPHEMERAL_HISTORY=1) and .env.auth (FASTAGENT_API_TOKEN), or pass --env-file explicitly.');
+      const environment = await loadExplicitSecrets(envFiles, cwd, runtimeKeysFor(config), sensitive);
       if (!record && auth.RAILWAY_TOKEN && !options.dryRun) throw new FastagentError('RAILWAY_ACCOUNT_REQUIRED', 'First deployment requires an account/workspace API token; project tokens require an existing recorded target.');
       const initial = record ?? { ...createDeploymentRecord(lock.selector), selectors,
         resources: name === 'cloudrun' ? [{ kind: 'project' as const, id: options.project!, ownership: 'external' as const }] : [] };

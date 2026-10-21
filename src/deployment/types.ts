@@ -29,7 +29,9 @@ const tokenCloudSchema = z.strictObject({
   FASTAGENT_API_TOKEN: z.string().regex(/^[A-Za-z0-9_-]{43,256}$/),
   OPENAI_API_KEY: secretText.optional(),
   OPENROUTER_API_KEY: secretText.optional(),
-  REDIS_URL: z.string().min(1).max(8192),
+  // Exactly one history backend: a TLS Redis URL, or explicit single-instance in-memory history.
+  REDIS_URL: z.string().min(1).max(8192).optional(),
+  FASTAGENT_EPHEMERAL_HISTORY: z.literal('1').optional(),
   APP_ORIGIN: z.string(),
   FASTAGENT_HISTORY_NAMESPACE: projectNameSchema,
 });
@@ -44,11 +46,13 @@ type ModelKeyEnvironment = { OPENAI_API_KEY?: string | undefined; OPENROUTER_API
 function oneModelKey(value: ModelKeyEnvironment): boolean {
   return Number(Boolean(value.OPENAI_API_KEY)) + Number(Boolean(value.OPENROUTER_API_KEY)) === 1;
 }
-function cleanToken<T extends ModelKeyEnvironment & { APP_ORIGIN?: string | undefined }>(value: T): T {
+function cleanToken<T extends ModelKeyEnvironment & { APP_ORIGIN?: string | undefined; REDIS_URL?: string | undefined; FASTAGENT_EPHEMERAL_HISTORY?: string | undefined }>(value: T): T {
   const cleaned = { ...value };
   if (!cleaned.OPENAI_API_KEY) delete cleaned.OPENAI_API_KEY;
   if (!cleaned.OPENROUTER_API_KEY) delete cleaned.OPENROUTER_API_KEY;
   if (cleaned.APP_ORIGIN === undefined) delete cleaned.APP_ORIGIN;
+  if (cleaned.REDIS_URL === undefined) delete cleaned.REDIS_URL;
+  if (cleaned.FASTAGENT_EPHEMERAL_HISTORY === undefined) delete cleaned.FASTAGENT_EPHEMERAL_HISTORY;
   return cleaned;
 }
 function validateRedisUrl(raw: string): void {
@@ -86,7 +90,10 @@ export function redisNamespaceVariable(environment: PreflightEnvironment): 'FAST
 }
 export function runtimeSecretKeys(environment: PreflightEnvironment): string[] {
   if (!isTokenRuntime(environment)) return ['FASTAGENT_PASSWORD_HASH', 'OPENAI_API_KEY', 'REDIS_URL'];
-  return ['FASTAGENT_API_TOKEN', environment.OPENROUTER_API_KEY ? 'OPENROUTER_API_KEY' : 'OPENAI_API_KEY', 'REDIS_URL'];
+  const keys = ['FASTAGENT_API_TOKEN', environment.OPENROUTER_API_KEY ? 'OPENROUTER_API_KEY' : 'OPENAI_API_KEY'];
+  // Ephemeral mode has no Redis secret; Redis mode still pins it.
+  if (environment.REDIS_URL !== undefined) keys.push('REDIS_URL');
+  return keys;
 }
 export function secretValue(environment: PreflightEnvironment, key: string): string {
   const value = (environment as unknown as Record<string, string | undefined>)[key];
@@ -98,9 +105,19 @@ export function secretValue(environment: PreflightEnvironment, key: string): str
 export function validatePreflightEnvironment(value: unknown): PreflightEnvironment {
   const parsed = parsePreflight(value);
   if (!parsed) throw new FastagentError('DEPLOYMENT_ENV_INVALID',
-    'Cloud preflight requires TLS Redis, a stable namespace, and either a password hash plus OpenAI key for an existing protected app, or a bearer token plus the model key selected by fastagent.yaml. Local development and unknown variables are forbidden.');
+    'Cloud preflight requires a history backend (TLS Redis or FASTAGENT_EPHEMERAL_HISTORY=1), a stable namespace, and either a password hash plus OpenAI key for an existing protected app, or a bearer token plus the model key selected by fastagent.yaml. Local development and unknown variables are forbidden.');
   if (parsed.APP_ORIGIN !== undefined) validateHttpsOrigin(parsed.APP_ORIGIN);
-  validateRedisUrl(parsed.REDIS_URL);
+  if (isTokenRuntime(parsed)) {
+    const hasRedis = parsed.REDIS_URL !== undefined;
+    const hasEphemeral = parsed.FASTAGENT_EPHEMERAL_HISTORY === '1';
+    if (hasRedis && hasEphemeral) throw new FastagentError('DEPLOYMENT_HISTORY_BACKEND_CONFLICT',
+      'Set exactly one history backend: remove either REDIS_URL or FASTAGENT_EPHEMERAL_HISTORY=1 before deploying.');
+    if (!hasRedis && !hasEphemeral) throw new FastagentError('DEPLOYMENT_HISTORY_BACKEND_MISSING',
+      'Set a TLS rediss:// REDIS_URL, or set FASTAGENT_EPHEMERAL_HISTORY=1 for single-instance in-memory history.');
+    if (hasRedis) validateRedisUrl(parsed.REDIS_URL!);
+  } else {
+    validateRedisUrl(parsed.REDIS_URL);
+  }
   return parsed;
 }
 

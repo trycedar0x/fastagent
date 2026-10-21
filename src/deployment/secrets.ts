@@ -1,8 +1,22 @@
 import { constants } from 'node:fs';
-import { open } from 'node:fs/promises';
+import { lstat, open } from 'node:fs/promises';
 import { basename, dirname, resolve } from 'node:path';
 import { parseEnv } from 'node:util';
 import { FastagentError } from '../errors.js';
+
+/** Conventional ignored runtime files, in priority order. Never recurses, never reads a shell, and
+ * never matches .env.example. A symlink or unexpected entry is still handed to loadExplicitSecrets,
+ * which refuses to follow it, so auto-detection cannot smuggle in an untrusted file. */
+export async function detectRuntimeEnvFiles(projectPath: string): Promise<string[]> {
+  const found: string[] = [];
+  for (const name of ['.env', '.env.auth']) {
+    try { await lstat(resolve(projectPath, name)); found.push(name); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new FastagentError('DEPLOYMENT_ENV_FILE_INVALID', 'Unable to inspect conventional env files in the project directory.');
+    }
+  }
+  return found;
+}
 
 const invalid = () => new FastagentError('DEPLOYMENT_SECRET_FILE_INVALID', 'Use explicit bounded regular env files with unique supported assignments; project-local files must be root .env or .env.* files, never .env.example.');
 
@@ -29,7 +43,9 @@ export async function loadExplicitSecrets(paths: readonly string[], projectPath:
       const source = buffer.subarray(0, used).toString('utf8');
       const parsed = parseEnv(source);
       sensitive.push(...Object.entries(parsed).flatMap(([key, value]) =>
-        value === undefined || ['APP_ORIGIN', 'FASTAGENT_SESSION_NAMESPACE', 'FASTAGENT_HISTORY_NAMESPACE'].includes(key) ? [] : [value]));
+        // Configuration, not credentials: redacting these would corrupt actionable messages that
+        // legitimately mention the origin, the namespace, or the ephemeral-history flag value.
+        value === undefined || ['APP_ORIGIN', 'FASTAGENT_SESSION_NAMESPACE', 'FASTAGENT_HISTORY_NAMESPACE', 'FASTAGENT_EPHEMERAL_HISTORY'].includes(key) ? [] : [value]));
       // Runtime secrets are single-line; reject parseEnv's permissive handling of malformed lines.
       const seen = new Set<string>();
       for (const line of source.split(/\r?\n/)) {

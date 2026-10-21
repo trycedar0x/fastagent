@@ -8,7 +8,7 @@ import { renderProject } from '../dist/scaffold/render.js';
 import { createProcessRunner, redactProcessOutput } from '../dist/deployment/process.js';
 import { DeploymentStore, canonicalDeploymentSelector, createDeploymentRecord, deploymentKey, validateDeploymentRecord } from '../dist/deployment/state.js';
 import { stageDeploymentSource } from '../dist/deployment/staging.js';
-import { validateCloudEnvironment, validatePreflightEnvironment, validateHttpsOrigin } from '../dist/deployment/types.js';
+import { runtimeSecretKeys, validateCloudEnvironment, validatePreflightEnvironment, validateHttpsOrigin } from '../dist/deployment/types.js';
 import { temporaryDirectory } from './helpers.mjs';
 
 const code = (expected) => (error) => {
@@ -123,6 +123,32 @@ test('deployment environment: shared TLS Redis, hash/key, exact HTTPS origin and
   for (const origin of ['http://localhost:3000', 'https://chat.example.invalid/', 'https://user:pass@example.invalid', 'https://example.invalid/?token=synthetic']) {
     assert.throws(() => validateHttpsOrigin(origin), code('DEPLOYMENT_ORIGIN_INVALID'));
   }
+});
+
+test('deployment environment: token history backend is exactly one of TLS Redis or the ephemeral opt-in', () => {
+  const tokenEnv = () => ({ FASTAGENT_API_TOKEN: 'a'.repeat(43), OPENROUTER_API_KEY: 'synthetic-openrouter-key',
+    APP_ORIGIN: 'https://chat.example.invalid', FASTAGENT_HISTORY_NAMESPACE: 'stable-token-app' });
+  const redis = { ...tokenEnv(), REDIS_URL: 'rediss://user:synthetic-redis@redis.invalid:6380/0' };
+  const ephemeral = { ...tokenEnv(), FASTAGENT_EPHEMERAL_HISTORY: '1' };
+  assert.deepEqual(validateCloudEnvironment(redis), redis);
+  assert.deepEqual(validateCloudEnvironment(ephemeral), ephemeral);
+  // Exactly one backend: both and neither both fail closed with distinct codes.
+  assert.throws(() => validateCloudEnvironment({ ...ephemeral, REDIS_URL: redis.REDIS_URL }), code('DEPLOYMENT_HISTORY_BACKEND_CONFLICT'));
+  assert.throws(() => validateCloudEnvironment(tokenEnv()), code('DEPLOYMENT_HISTORY_BACKEND_MISSING'));
+  // The opt-in is the literal 1, and Redis still has to be TLS.
+  assert.throws(() => validateCloudEnvironment({ ...tokenEnv(), FASTAGENT_EPHEMERAL_HISTORY: 'true' }), code('DEPLOYMENT_ENV_INVALID'));
+  assert.throws(() => validateCloudEnvironment({ ...tokenEnv(), REDIS_URL: 'redis://redis.invalid' }), code('DEPLOYMENT_ENV_INVALID'));
+  // Preflight (no origin yet) keeps the same history rule and omits the Redis secret in ephemeral mode.
+  const { APP_ORIGIN: _o, ...ephemeralPreflight } = ephemeral;
+  assert.deepEqual(validatePreflightEnvironment(ephemeralPreflight), ephemeralPreflight);
+  assert.deepEqual(runtimeSecretKeys(redis), ['FASTAGENT_API_TOKEN', 'OPENROUTER_API_KEY', 'REDIS_URL']);
+  assert.deepEqual(runtimeSecretKeys(ephemeral), ['FASTAGENT_API_TOKEN', 'OPENROUTER_API_KEY']);
+  // The legacy protected variant is unchanged: it still rejects ephemeral and still requires Redis.
+  const protectedEnv = cloudEnv();
+  assert.deepEqual(runtimeSecretKeys(protectedEnv), ['FASTAGENT_PASSWORD_HASH', 'OPENAI_API_KEY', 'REDIS_URL']);
+  const { REDIS_URL: _r, ...withoutRedis } = protectedEnv;
+  assert.throws(() => validateCloudEnvironment(withoutRedis), code('DEPLOYMENT_ENV_INVALID'));
+  assert.throws(() => validateCloudEnvironment({ ...protectedEnv, FASTAGENT_EPHEMERAL_HISTORY: '1' }), code('DEPLOYMENT_ENV_INVALID'));
 });
 
 test('deployment state: canonical project/provider/target keys and random stable ownership/namespace', async (t) => {

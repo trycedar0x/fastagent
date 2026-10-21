@@ -8,13 +8,15 @@ import { initProject } from '../dist/scaffold/init.js';
 import { openaiTemplate, renderProject } from '../dist/scaffold/render.js';
 import { temporaryDirectory } from './helpers.mjs';
 
-const expectedFiles = [...openaiTemplate.files, 'fastagent.yaml', 'package.json'].sort();
+const renderedFiles = [...openaiTemplate.files, 'fastagent.yaml', 'package.json'].sort();
+// init generates .env.auth at write time; it is intentionally not a render manifest entry.
+const expectedFiles = [...renderedFiles, '.env.auth'].sort();
 const expectedRootFiles = [...new Set(expectedFiles.map(path => path.split('/')[0]))].sort();
 
 test('scaffold: deterministic rendering and template metadata boundary', async () => {
   const first = await renderProject(createConfig('weather-agent'));
   assert.deepEqual(first, await renderProject(createConfig('weather-agent')));
-  assert.deepEqual(first.map((file) => file.path).sort(), expectedFiles);
+  assert.deepEqual(first.map((file) => file.path).sort(), renderedFiles);
   assert.equal(openaiTemplate.framework, 'openai');
   assert.equal(openaiTemplate.stage, 'runnable');
   const changed = await renderProject(createConfig('different-agent'));
@@ -46,6 +48,25 @@ test('scaffold: explicit name, standalone runnable metadata and nested runtime a
   const readme = await readFile(join(result.directory, 'README.md'), 'utf8');
   assert.match(readme, /runnable Node.js 22/);
   assert.match(readme, /not a cloud deployment integration/);
+});
+
+test('scaffold: init generates an ignored owner-only bearer token that is never overwritten', async (t) => {
+  const cwd = await temporaryDirectory(t);
+  const result = await initProject({ directory: 'agent', cwd });
+  const authPath = join(result.directory, '.env.auth');
+  const content = await readFile(authPath, 'utf8');
+  const match = /^FASTAGENT_API_TOKEN=([A-Za-z0-9_-]{43})\n$/.exec(content);
+  assert.ok(match, 'auth file holds one base64url token');
+  assert.equal(Buffer.from(match[1], 'base64url').length, 32);
+  assert.equal((await lstat(authPath)).mode & 0o777, 0o600);
+  assert.ok(result.files.includes('.env.auth'));
+  assert.ok((await readFile(join(result.directory, '.gitignore'), 'utf8')).split('\n').includes('.env.*'));
+  assert.ok((await readFile(join(result.directory, '.dockerignore'), 'utf8')).includes('.env.*'));
+  // The token must never appear in the structured result.
+  assert.ok(!JSON.stringify(result).includes(match[1]));
+  // A repeat init refuses the existing directory and leaves the generated token untouched.
+  await assert.rejects(initProject({ directory: 'agent', cwd }), { code: 'DESTINATION_EXISTS' });
+  assert.equal(await readFile(authPath, 'utf8'), content);
 });
 
 test('scaffold: blank environment placeholders and local/container secret exclusions', async (t) => {

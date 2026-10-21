@@ -20,7 +20,7 @@ node dist/cli.js --help
 
 From an app directory, use the absolute path to that file. Building does not install a global command or publish a package.
 
-Prefer `--json`. It returns one stdout object. `dev`, interactive login, and the interactive dashboard are text-only; `dashboard --json` is an offline snapshot.
+Prefer `--json`. It returns one stdout object with stable `error.code` values. `dev --json` prints one `{"ok":true,"command":"dev","url":...}` line once the server listens and then keeps running, so run it as a background process and poll health with `check --json`. Interactive login is text-only; `dashboard --json` is an offline snapshot.
 
 Exit codes: 0 success, 1 operation/configuration failure, 2 invalid arguments, 130 SIGINT, 143 SIGTERM. Dashboard also handles SIGHUP and SIGQUIT while restoring terminal settings.
 
@@ -34,6 +34,26 @@ Do not read secrets into chat, print them, or place them in command arguments. D
 
 Do not expose unprotected chat or tunnel local development.
 
+## Non-interactive contract
+
+Every command is safe inside a coding-agent tool call and never blocks waiting for input it was not explicitly asked to read.
+
+- No command reads stdin implicitly. `fastagent chat` requires `--message <text>`, or the explicit `--stdin` (`--message -`) opt-in to read a piped message. With neither, it exits immediately with `INVALID_ARGUMENTS`; it never falls back to stdin.
+- No TTY is required for any non-interactive command. Interactive behavior is opt-in only: `login --provider cloudrun --interactive` and the TUI `dashboard` need a terminal and fail fast with `LOGIN_INTERACTIVE_REQUIRED` / `TTY_REQUIRED` when it is absent. No command ever waits on stdin it was not explicitly told to read: `chat` requires `--message`, or an explicit `--stdin` (equivalently `--message -`). There are no prompts, pagers, or terminal-dependent progress output.
+- Commands are idempotent and safely re-runnable: `init` never overwrites, a repeat `init` fails with `DESTINATION_EXISTS`, `.env.auth` is written once with mode 0600, and deploy reuses recorded state instead of recreating resources.
+
+## Machine-readable output
+
+`--json` writes one JSON object to stdout. Success is `{"ok":true,...}`; errors are `{"ok":false,"error":{"code":"<stable-code>","message":"<actionable, secret-free>"}}`. Exit codes: 0 success, 1 operation/configuration failure, 2 invalid arguments, 130 SIGINT, 143 SIGTERM. Parse `error.code` rather than prose.
+
+Codes for the deployment-smoothing behavior, each usable to branch and recover:
+
+- `DEPLOYMENT_HISTORY_BACKEND_CONFLICT` — both `REDIS_URL` and `FASTAGENT_EPHEMERAL_HISTORY=1` were supplied. Remove one.
+- `DEPLOYMENT_HISTORY_BACKEND_MISSING` — neither a TLS `rediss:// REDIS_URL` nor `FASTAGENT_EPHEMERAL_HISTORY=1` was supplied. Add exactly one.
+- `DEPLOYMENT_SINGLE_INSTANCE_REQUIRED` — ephemeral history was requested but the provider did not confirm a single-instance pin. Set `REDIS_URL` or resolve the instance setting, then retry.
+- `DEPLOYMENT_ENV_FILE_MISSING` — no `--env-file` was given and auto-detection found neither ignored `.env` nor `.env.auth`. Create them or pass `--env-file`.
+- `INVALID_ARGUMENTS` — a required flag is missing (for example `chat` without `--message`/`--stdin`).
+
 ## Create and run an app
 
 `init <directory> [--name <name>] [--framework openai] [--json]`
@@ -45,17 +65,20 @@ Do not expose unprotected chat or tunnel local development.
 
 A new app is headless with bearer-token access. It does not serve a browser password UI or `/api/login`.
 
+`init` already generated an ignored, owner-only `.env.auth` with a random `FASTAGENT_API_TOKEN`; it is never printed and never returned in JSON. Do not overwrite it on re-run.
+
 If the user wants local chat:
 
 1. Install dependencies in the generated app.
-2. Have the user generate a random `FASTAGENT_API_TOKEN` (at least 32 random bytes, base64url) into ignored `.env.auth`.
-3. Have the user put the model key selected by `fastagent.yaml` into ignored `.env`.
-4. Run `dev <directory>`; `--install` separately authorizes dependency installation.
-5. Send a message with `fastagent chat --url <origin> --env-file .env.auth --message "..."`.
+2. Have the user put the model key selected by `fastagent.yaml` into ignored `.env` (`OPENROUTER_API_KEY` or `OPENAI_API_KEY`, never both).
+3. Run `dev <directory>`; `--install` separately authorizes dependency installation.
+4. Send a message with `fastagent chat --url <origin> --env-file .env.auth --message "..."`.
 
-The token is read only from the explicit `--env-file`; never invent one or pass it as a command argument. Local development uses memory history, needs no Redis, binds to IPv4 loopback, and has no hot reload.
+The chat token is read only from an explicit `--env-file`; never invent one or pass it as a command argument. `chat` never reads stdin unless you pass `--stdin` (`--message -`). Local development uses memory history, needs no Redis, binds to IPv4 loopback, and has no hot reload.
 
 Use the `fastagent-app` skill for prompt/tool edits.
+
+Starting the generated agent requires a nonblank matching model key in ignored `.env`: `OPENROUTER_API_KEY` for the default OpenRouter model, or `OPENAI_API_KEY` for direct OpenAI. Missing/blank keys prevent startup before readiness; `dev --json` returns `MODEL_API_KEY_MISSING` with the required setting. Never ask the user to paste the key into chat. Local models are not supported. Init and builds remain credential-free; startup and health never call a model.
 
 ## Choose a model
 
@@ -65,7 +88,9 @@ Use the `fastagent-app` skill for prompt/tool edits.
 
 Run lifecycle commands inside the app directory. `--target` defaults to the configured app name.
 
-For production, `.env` supplies the model key selected by `fastagent.yaml` (`OPENROUTER_API_KEY` or `OPENAI_API_KEY`) and TLS `REDIS_URL`; `.env.auth` supplies `FASTAGENT_API_TOKEN`. Pass both explicitly. Local secret files must be root `.env` or `.env.*`, not `.env.example`; omit empty assignments. Do not set both model keys.
+For production, `.env` supplies the model key selected by `fastagent.yaml` (`OPENROUTER_API_KEY` or `OPENAI_API_KEY`) and exactly one history backend: TLS `REDIS_URL`, or `FASTAGENT_EPHEMERAL_HISTORY=1` for single-instance in-memory history. `.env.auth` supplies `FASTAGENT_API_TOKEN`. When `--env-file` is omitted, deploy auto-detects the ignored `.env` then `.env.auth` in the app directory (never `.env.example`, never the shell); explicit `--env-file` flags still win. Local secret files must be root `.env` or `.env.*`, not `.env.example`; omit empty assignments. Do not set both model keys.
+
+Ephemeral mode is an explicit opt-in accepted only as the literal `1`. It is safe only when the deployment pins one instance: Cloud Run is capped at one instance and Railway is pinned to one replica. Both or neither backend fails closed with a distinct code. History lives in memory and is lost on restart; `GET /healthz` still works. Never enable it without the single-instance pin.
 
 Leave `APP_ORIGIN` unset on first deployment. The CLI sets the exact provider origin. A supplied update origin must match the recorded URL. Preserve the recorded history namespace.
 
@@ -76,9 +101,10 @@ Requires Railway CLI, workspace ID, and an account/workspace token in ignored `.
 ```sh
 fastagent login --provider railway
 fastagent deploy --provider railway --workspace WORKSPACE_ID \
-  --auth-file .env.railway \
-  --env-file .env --env-file .env.auth --dry-run --json
+  --auth-file .env.railway --dry-run --json
 ```
+
+`.env` and `.env.auth` are auto-detected; add `--env-file .env --env-file .env.auth` to override. `--auth-file` is always explicit.
 
 Login only prints instructions. It does not prove authentication.
 
@@ -92,8 +118,10 @@ Requires gcloud auth, project/region, billing/APIs/permissions, and existing dis
 fastagent login --provider cloudrun --interactive
 fastagent deploy --provider cloudrun --project PROJECT_ID --region REGION \
   --runtime-account RUNTIME_EMAIL --build-account BUILD_EMAIL \
-  --env-file .env --env-file .env.auth --dry-run --json
+  --dry-run --json
 ```
+
+`.env` and `.env.auth` are auto-detected.
 
 Interactive login needs a terminal and cannot use `--json`. Fastagent does not create Redis, enable billing/APIs, or grant broad project roles.
 
@@ -109,7 +137,7 @@ Do not blindly retry uncertain mutations or delete resources based only on their
 
 `check` reads the current app's saved target and requests HTTPS `/healthz` only. Choose `--provider` if both providers are recorded. Health does not certify model keys or tools; it never calls a model.
 
-`check --chat` is unsupported and exits before secret/network access. To test chat, use `fastagent chat`, which sends one real, billable request with a message or stdin and can resume a conversation with `--conversation`.
+`check --chat` is unsupported and exits before secret/network access. To test chat, use `fastagent chat`, which sends one real, billable request with an explicit `--message <text>` or `--stdin` (`--message -`) and can resume a conversation with `--conversation`. It never reads stdin implicitly.
 
 The dashboard lists local records. It does not discover cloud apps. Keys: arrows select, Enter opens the URL, R refreshes, L shows logs, Q quits. Status/log actions need explicit matching provider settings and auth. Automatic polling is health-only; displayed deployment status is initially cached.
 

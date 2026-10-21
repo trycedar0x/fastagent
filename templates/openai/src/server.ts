@@ -61,6 +61,10 @@ function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
 // Tests/custom runtimes may inject a ChatModel and HistoryStore; standalone uses official SDK/Redis.
 export async function createRuntime(config: RuntimeConfig) {
   validateRuntimeConfig(config);
+  if (config.ephemeralHistory) {
+    // One bounded warning at startup; carries no secret. The deployment must pin exactly one instance.
+    process.stderr.write('Warning: FASTAGENT_EPHEMERAL_HISTORY=1 — conversation history is in memory only, is not shared between instances, and is lost on every restart. Use only with a deployment pinned to a single instance.\n');
+  }
   const store = config.historyStore ?? (config.redisUrl
     ? await createRedisHistoryStore(config.redisUrl, config.historyNamespace!, config.localDev)
     : createMemoryHistoryStore());

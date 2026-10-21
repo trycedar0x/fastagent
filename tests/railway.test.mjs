@@ -10,6 +10,11 @@ import { FastagentError } from '../dist/errors.js';
 const env = () => ({ FASTAGENT_PASSWORD_HASH: `scrypt-v1$${'a'.repeat(32)}$${'b'.repeat(128)}`,
   OPENAI_API_KEY: 'synthetic-model-credential', REDIS_URL: 'rediss://fixture:synthetic-redis-credential@redis.invalid/0',
   FASTAGENT_SESSION_NAMESPACE: 'railway-test' });
+const tokenApiToken = 't'.repeat(43);
+const tokenEnv = (extra = {}) => ({ FASTAGENT_API_TOKEN: tokenApiToken, OPENROUTER_API_KEY: 'synthetic-openrouter-credential',
+  REDIS_URL: 'rediss://fixture:synthetic-redis-credential@redis.invalid/0', FASTAGENT_HISTORY_NAMESPACE: 'railway-ephemeral', ...extra });
+const ephemeralEnv = () => ({ FASTAGENT_API_TOKEN: tokenApiToken, OPENROUTER_API_KEY: 'synthetic-openrouter-credential',
+  FASTAGENT_EPHEMERAL_HISTORY: '1', FASTAGENT_HISTORY_NAMESPACE: 'railway-ephemeral' });
 const ref = (name) => ({ name, kind: name === 'Int' || name === 'String' || name === 'Boolean' || name === 'JSON' ? 'SCALAR' : 'OBJECT', ofType: null });
 const field = (name, type, args = []) => ({ name, type: ref(type), args: args.map(([name, type]) => ({ name, type: ref(type) })) });
 function schemaProfile() {
@@ -30,7 +35,7 @@ function schemaProfile() {
   ] };
 }
 const errorCode = (code) => (error) => { assert.equal(error.code, code); return true; };
-async function fixture(t, changes = {}) {
+async function fixture(t, changes = {}, runtimeEnv = env()) {
   const root = await temporaryDirectory(t);
   const projectPath = join(root, 'project'); await mkdir(projectPath);
   const directory = join(root, 'stage'); await mkdir(directory);
@@ -62,7 +67,7 @@ async function fixture(t, changes = {}) {
     if (a.includes('--help')) return { stdout: remote.help ?? '--name --workspace --json --service --project --environment --port --stdin --skip-deploys --path-as-root --detach --lines', stderr: '', exitCode: 0 };
     if (a[0] === 'whoami') response = { name: null, email: 'fixture@example.invalid', workspaces: [{ id: remote.workspace, name: 'workspace' }] };
     else if (a[0] === 'init') {
-      if (remote.initError) throw new Error(env().OPENAI_API_KEY);
+      if (remote.initError) throw new Error(runtimeEnv.OPENAI_API_KEY ?? runtimeEnv.OPENROUTER_API_KEY);
       assert.equal(current.status, 'deploying');
       response = { id: 'project-1', name: 'agent' };
     } else if (a[0] === 'add') {
@@ -75,8 +80,8 @@ async function fixture(t, changes = {}) {
       assert.ok(current.resources.some((item) => item.id === 'service-1'));
       if (a.includes('--stdin')) remote.variables[a[2]] = request.stdin;
       else for (const value of a.slice(2)) if (value.includes('=')) { const index = value.indexOf('='); remote.variables[value.slice(0, index)] = value.slice(index + 1); }
-      if (remote.variableError) throw new Error(env().OPENAI_API_KEY);
-      return { stdout: `${env().OPENAI_API_KEY} ${env().REDIS_URL}`, stderr: '', exitCode: 0 };
+      if (remote.variableError) throw new Error(runtimeEnv.OPENAI_API_KEY ?? runtimeEnv.OPENROUTER_API_KEY);
+      return { stdout: `${runtimeEnv.OPENAI_API_KEY ?? runtimeEnv.OPENROUTER_API_KEY} ${runtimeEnv.REDIS_URL ?? ''}`, stderr: '', exitCode: 0 };
     } else if (a[0] === 'domain' && a[1] === 'list') response = { domains: remote.domains };
     else if (a[0] === 'domain') {
       assert.equal(current.status, 'deploying'); assert.ok(current.resources.some((item) => item.id === 'service-1'));
@@ -88,7 +93,8 @@ async function fixture(t, changes = {}) {
       assert.equal(current.phase, 'secrets-configured'); assert.equal(current.status, 'deploying');
       assert.equal(current.url, 'https://agent.up.railway.app');
       assert.equal(remote.variables.APP_ORIGIN, current.url);
-      assert.equal(remote.variables.FASTAGENT_SESSION_NAMESPACE, current.sessionNamespace);
+      const namespaceKey = 'FASTAGENT_SESSION_NAMESPACE' in runtimeEnv ? 'FASTAGENT_SESSION_NAMESPACE' : 'FASTAGENT_HISTORY_NAMESPACE';
+      assert.equal(remote.variables[namespaceKey], current.sessionNamespace);
       assert.ok(!('FASTAGENT_LOCAL_DEV' in remote.variables));
       remote.uploads++;
       if (remote.upError) throw new Error('uncertain upload');
@@ -100,7 +106,7 @@ async function fixture(t, changes = {}) {
         { id: 'newer-unrelated', status: 'SUCCESS', createdAt: '2026-02-01T00:00:00Z', meta: {} },
       ];
     } else if (a[0] === 'logs') {
-      response = { timestamp: '2026-01-01T00:00:00Z', message: `${env().OPENAI_API_KEY} ${env().REDIS_URL} synthetic-redis-credential ${remote.variables.CUSTOM_AUTH ?? ''}` };
+      response = { timestamp: '2026-01-01T00:00:00Z', message: `${runtimeEnv.OPENAI_API_KEY ?? runtimeEnv.OPENROUTER_API_KEY} ${runtimeEnv.REDIS_URL ?? ''} synthetic-redis-credential ${remote.variables.CUSTOM_AUTH ?? ''}` };
     } else assert.equal(a[0], 'link');
     return { stdout: JSON.stringify(response), stderr: '', exitCode: 0 };
   };
@@ -112,8 +118,8 @@ async function fixture(t, changes = {}) {
     }
     assert.equal(request.url, 'https://backboard.railway.com/graphql/v2');
     const { query, variables } = request.body;
-    if (remote.httpError) throw new Error(env().REDIS_URL);
-    if (remote.graphqlErrors) return { status: 200, body: { errors: [{ message: env().OPENAI_API_KEY }] } };
+    if (remote.httpError) throw new Error(runtimeEnv.REDIS_URL ?? 'synthetic-redis-error');
+    if (remote.graphqlErrors) return { status: 200, body: { errors: [{ message: runtimeEnv.OPENAI_API_KEY ?? runtimeEnv.OPENROUTER_API_KEY }] } };
     let data;
     if (query.includes('__schema')) data = { __schema: remote.schema };
     else if (query.includes('serviceInstanceUpdate')) {
@@ -136,11 +142,11 @@ async function fixture(t, changes = {}) {
   };
   const options = { workspaceId: 'workspace-1', credentials: { scope: 'account', token: 'synthetic-account-credential' }, http,
     commandEnv: { PATH: '/synthetic/bin' }, pollIntervalMs: 1, deploymentTimeoutMs: 30, requestTimeoutMs: 1000 };
-  const input = { selector, runner, state, source: { directory, config: { name: 'agent' }, files: ['Dockerfile', '.railwayignore'] }, environment: env() };
-  return { options, input, state, remote, commands, requests, events, checkpoints, provider: createRailwayProvider(options),
+  const input = { selector, runner, state, source: { directory, config: { name: 'agent' }, files: ['Dockerfile', '.railwayignore'] }, environment: runtimeEnv };
+  return { options, input, state, remote, commands, requests, events, checkpoints, provider: createRailwayProvider(options), runtimeEnv,
     record: () => current, seed: async () => {
       let record = createDeploymentRecord(selector);
-      record = { ...record, sessionNamespace: env().FASTAGENT_SESSION_NAMESPACE, selectors: { project: 'workspace-1' },
+      record = { ...record, sessionNamespace: runtimeEnv.FASTAGENT_SESSION_NAMESPACE ?? runtimeEnv.FASTAGENT_HISTORY_NAMESPACE, selectors: { project: 'workspace-1' },
         resources: [{ kind: 'project', id: 'project-1', ownership: 'external' }, { kind: 'environment', id: 'env-1', ownership: 'external' },
           { kind: 'service', id: 'service-1', ownership: 'owned' }], phase: 'resources-created' };
       remote.services = [{ id: 'service-1' }]; remote.variables = { FASTAGENT_OWNERSHIP_MARKER: record.ownershipMarker };
@@ -189,6 +195,36 @@ test('railway fresh deploy: exact checkpoints, origin before activation, stdin s
   const serviceCheckpoint = f.events.findIndex((event) => event.checkpoint?.resources.some((entry) => entry.kind === 'service'));
   const markerIndex = f.events.findIndex((event) => event.command?.args[0] === 'variable' && event.command.intent === 'mutate');
   assert.ok(projectCheckpoint < addIndex); assert.ok(serviceCheckpoint < markerIndex);
+});
+
+test('railway token ephemeral: no Redis variable, explicit opt-in flag, single replica pin', async (t) => {
+  const f = await fixture(t, {}, ephemeralEnv());
+  const result = await f.provider.deploy(f.input);
+  assert.equal(result.status, 'ready'); assert.equal(result.sessionNamespace, 'railway-ephemeral');
+  const secretSets = f.commands.filter((r) => r.intent === 'mutate' && r.args.includes('--stdin'));
+  assert.equal(secretSets.length, 2);
+  assert.deepEqual(secretSets.map((r) => r.args[2]).sort(), ['FASTAGENT_API_TOKEN', 'OPENROUTER_API_KEY']);
+  assert.ok(!('REDIS_URL' in f.remote.variables));
+  assert.equal(f.remote.variables.FASTAGENT_EPHEMERAL_HISTORY, '1');
+  const update = f.requests.find((r) => r.body?.query.includes('serviceInstanceUpdate'));
+  assert.equal(update.body.variables.input.numReplicas, 1);
+  for (const value of [tokenApiToken, 'synthetic-openrouter-credential']) assert.ok(!JSON.stringify(f.checkpoints).includes(value));
+});
+
+test('railway ephemeral refuses when the single-replica setting is not confirmed', async (t) => {
+  const f = await fixture(t, { configureResult: false }, ephemeralEnv());
+  await assert.rejects(f.provider.deploy(f.input), errorCode('DEPLOYMENT_SINGLE_INSTANCE_REQUIRED'));
+  assert.equal(f.remote.uploads, 0);
+});
+
+test('railway token Redis: REDIS_URL stays a secret variable and no ephemeral flag appears', async (t) => {
+  const f = await fixture(t, {}, tokenEnv());
+  const result = await f.provider.deploy(f.input);
+  assert.equal(result.status, 'ready');
+  const secretSets = f.commands.filter((r) => r.intent === 'mutate' && r.args.includes('--stdin'));
+  assert.equal(secretSets.length, 3);
+  assert.ok(secretSets.some((r) => r.args[2] === 'REDIS_URL'));
+  assert.ok(!('FASTAGENT_EPHEMERAL_HISTORY' in f.remote.variables));
 });
 
 test('railway update: reuse verified service/domain/namespace, not another latest deployment', async (t) => {
