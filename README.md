@@ -21,8 +21,8 @@ Agent idea: [Describe who it helps, what it should do, and any APIs it needs.]
 
 Build the CLI from source: clone https://github.com/trycedar0x/fastagent,
 run npm ci and npm run build, then use node dist/cli.js for every command.
-Do not install the published npm 0.1.0, which is the older password-protected
-release and does not provide the headless behavior described here.
+Alternatively, install @0xtryeva/fastagent@0.2.0 with npm and use fastagent.
+Version 0.1.0 is the older password-protected release.
 Create the app in a new directory; never overwrite existing files.
 
 Read AGENTS.md, docs/user-guide.md, and .agents/skills/fastagent/SKILL.md
@@ -48,16 +48,13 @@ was actually verified; a dry run or health check does not prove chat works.
 
 ## Start here
 
-**Released version:** npm `@0xtryeva/fastagent` is `0.1.0`, the earlier password-protected app. The headless bearer-token behavior described in this README is unreleased source, so build it from this repository. The unscoped `fastagent` npm package is a different, unrelated project.
+**Version 0.2.0:** `@0xtryeva/fastagent` provides the headless bearer-token CLI described here. Version 0.1.0 generated the earlier password-protected app. The unscoped `fastagent` npm package is a different, unrelated project.
 
-You need Node.js 22+ and npm. Build the CLI and create an app:
+You need Node.js 22+ and npm. Install the CLI and create an app:
 
 ```sh
-git clone https://github.com/trycedar0x/fastagent.git
-cd fastagent
-npm ci
-npm run build
-node dist/cli.js init ./my-agent --framework openai
+npm install -g @0xtryeva/fastagent@0.2.0
+fastagent init ./my-agent --framework openai
 ```
 
 This creates a new app in `my-agent/`; existing directories are never overwritten.
@@ -71,18 +68,18 @@ npm install
 
 `init` has already written an ignored, owner-only `.env.auth` with a random bearer token (32 random bytes, base64url), so you only need an ignored `.env` with the model key selected by `fastagent.yaml`. The default model is `openrouter/deepseek/deepseek-v4.1-flash`, which requires `OPENROUTER_API_KEY`; an `openai/<model>` reference requires `OPENAI_API_KEY` instead. Never print, commit, or paste the token.
 
-Run from the app directory, using this checkout:
+Run from the app directory:
 
 ```sh
-node /path/to/fastagent/dist/cli.js dev
+fastagent dev
 ```
 
-The [user guide](docs/user-guide.md) uses the same source-based invocation. A global `fastagent` command exists only after you install a published release, which does not yet contain this behavior.
+The [user guide](docs/user-guide.md) uses source-based invocation. With the npm installation above, use `fastagent` instead of `node /path/to/fastagent/dist/cli.js`.
 
 `dev` builds and starts the headless server on explicit localhost HTTP. It does not serve a browser UI. Local development uses memory history and needs no Redis. Send a message with the headless client:
 
 ```sh
-node /path/to/fastagent/dist/cli.js chat --url http://127.0.0.1:3000 --env-file .env.auth --message "Hello"
+fastagent chat --url http://127.0.0.1:3000 --env-file .env.auth --message "Hello"
 ```
 
 The bearer token is read only from the explicit `--env-file`, never from a command argument or the inherited shell. Real chats use your API key and may cost money. Do not expose the local HTTP port to the internet.

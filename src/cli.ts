@@ -73,7 +73,7 @@ or cloud status APIs. Recorded deployment status and HTTP health remain separate
 dev runs on explicit localhost HTTP; --install opts in to npm installation.
 dev --json prints one {"ok":true,"command":"dev","url":...} line once the server listens, then runs until stopped.
 There is no native iMessage integration. A separate Mac-side bridge can call this API; cloud hosts cannot access Apple Messages.
-Published npm 0.1.0 is the previous password-protected app. This source is unreleased headless behavior.
+Version 0.2.0 provides headless bearer-token apps. Published npm 0.1.0 is the previous password-protected app.
 JSON results are written to stdout, including errors; text errors use stderr.
 Exit codes: 0 success, 1 operation/configuration failure, 2 invalid arguments;
 130 SIGINT and 143 SIGTERM for deployment/check/dashboard/chat (deployment checkpoints retained).
