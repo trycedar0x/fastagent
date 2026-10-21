@@ -30,7 +30,7 @@ Start deployment with `--dry-run`. Remove it only after the user explicitly auth
 
 Also obtain permission before destructive commands, interactive login, publication, or paid model calls. Never describe a dry run or mock test as a live deployment.
 
-Do not read secrets into chat, print them, or place them in command arguments. Deployment and `chat` read runtime secrets only from explicit `--env-file` paths and Railway tokens only from `--auth-file`, not from the shell. Local `dev` is different: the app loads its ignored `.env` and `.env.auth` files automatically. Cloud Run uses native gcloud authentication.
+Do not read secrets into chat, print them, or place them in command arguments. CLI `chat` reads credentials only from explicit `--env-file` paths. Deployment uses explicit `--env-file` paths or auto-detects ignored `.env` then `.env.auth`; Railway tokens come only from explicit `--auth-file`. Neither command inherits credentials from the shell. Local `dev` is different: inherited environment variables take precedence over its ignored `.env` and `.env.auth` files. Cloud Run uses native gcloud authentication.
 
 Do not expose unprotected chat or tunnel local development.
 
@@ -79,6 +79,8 @@ The chat token is read only from an explicit `--env-file`; never invent one or p
 Use the `fastagent-app` skill for prompt/tool edits.
 
 Starting the generated agent requires a nonblank matching model key in ignored `.env`: `OPENROUTER_API_KEY` for the default OpenRouter model, or `OPENAI_API_KEY` for direct OpenAI. Missing/blank keys prevent startup before readiness; `dev --json` returns `MODEL_API_KEY_MISSING` with the required setting. Never ask the user to paste the key into chat. Local models are not supported. Init and builds remain credential-free; startup and health never call a model.
+
+Local `dev` inherits environment variables: inherited values override `.env.auth`, which overrides `.env`. Files are loaded once; restart after edits and unset conflicting inherited values without displaying secrets. Local startup warns that memory history disappears on restart. Unlike local dev, `chat` and deployment never inherit credentials from the shell.
 
 ## Choose a model
 
@@ -142,6 +144,8 @@ Do not blindly retry uncertain mutations or delete resources based only on their
 The dashboard lists local records. It does not discover cloud apps. Keys: arrows select, Enter opens the URL, R refreshes, L shows logs, Q quits. Status/log actions need explicit matching provider settings and auth. Automatic polling is health-only; displayed deployment status is initially cached.
 
 `dashboard --json` is offline and needs no terminal.
+
+Omitting `--conversation` starts a new conversation; follow-ups must reuse the server ID from `conversation: <id>` or JSON `conversationId`. `OUTPUT_TOKEN_LIMIT` means the provider reported completion-budget exhaustion; ask for a shorter reply or have the owner adjust top-level `maxOutputTokens` in `fastagent.yaml` (default 4096, integer 1–16384 per model step). Restart/redeploy after changes. Reasoning may share the budget, and up to three steps can each consume it. Higher caps permit increased cost/latency; timeout and byte limits remain. Never automatically retry; partial replies are not committed.
 
 ## Change Fastagent
 

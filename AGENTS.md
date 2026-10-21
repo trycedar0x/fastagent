@@ -59,3 +59,7 @@ Delegate only when authorized. Keep one writer per checkout or isolated worktree
 Reviewers are read-only. If a tool fails or another writer changes files unexpectedly, pause and report it; do not silently switch execution modes or revert someone else's work.
 
 Do not commit or push unless asked.
+
+## Shipping requires a pull request
+
+Every ship must go through a pull request targeting `main`, merged by squash only. Work on a feature branch; never commit or push directly to `main`, force-push it, or bypass or weaken its protection. When the user asks to ship or commit and push, push the feature branch and open a PR rather than updating `main` directly. Do not merge the PR unless explicitly authorized; when authorized, use squash merge, never a merge commit or rebase merge. Publish npm releases only from changes already merged through a PR, with separate explicit publication authorization. Do not commit or push without the user's permission.

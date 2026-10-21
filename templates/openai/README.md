@@ -17,7 +17,7 @@ Create ignored `.env` with the model key selected by `fastagent.yaml`. The defau
 Start the app with your Fastagent CLI:
 
 ```sh
-node /path/to/fastagent/dist/cli.js dev
+fastagent dev
 ```
 
 If Fastagent is not on PATH, use the absolute path to its built `dist/cli.js`:
@@ -36,9 +36,19 @@ Send a message with the CLI, from the app directory or with an explicit token fi
 node /path/to/fastagent/dist/cli.js chat --url http://127.0.0.1:3000 --env-file .env.auth --message "Hello"
 ```
 
-The token is read only from that file, never from the command line or the shell.
+**Omitting `--conversation` starts a new conversation on every call.** The CLI does not automatically resume your last chat. After a successful response, copy the server-assigned ID from the `conversation: <id>` output line (or the `conversationId` field with `--json`). Pass that same ID on each follow-up to reuse the stored history:
+
+```sh
+node /path/to/fastagent/dist/cli.js chat --url http://127.0.0.1:3000 --env-file .env.auth --conversation "<id-from-first-response>" --message "Tell me more about your previous answer."
+```
+
+Replace `<id-from-first-response>` with the actual ID; do not invent one. Use the same app URL and token file. An unknown, expired, or deleted conversation returns 404 rather than starting a new one. Local development and ephemeral production history are lost on restart; omit `--conversation` to start fresh in that case. Each chat request can incur model charges.
+
+The CLI `chat` client reads its bearer token only from the explicit `--env-file .env.auth`, never from an inherited shell variable or a token-valued command argument. The local server started by `dev` has different loading rules (below): an inherited `FASTAGENT_API_TOKEN` overrides `.env.auth`. If that value differs from the client's file, chat authentication fails. Unset `FASTAGENT_API_TOKEN` in the server's launching shell and restart `dev` to use the generated file; never print or paste either token.
 
 A matching model API key is required before startup: put `OPENROUTER_API_KEY` (default) or `OPENAI_API_KEY` (direct OpenAI) in ignored `.env`. Missing or blank keys prevent startup; `dev --json` reports `MODEL_API_KEY_MISSING`. Local models are not supported. Scaffolding and builds need no credentials.
+
+Local `dev` loads `.env` and then `.env.auth` once at startup. Existing inherited environment variables take precedence over both files; otherwise `.env.auth` wins over `.env` for duplicate names. Restart after changing either file. If a file change seems ignored, unset the conflicting variable in the launching shell before restarting—never print its value. This inheritance is specific to local development: CLI `chat` and deployment do not inherit credentials from the shell.
 
 ## Edit the agent
 
@@ -51,6 +61,8 @@ The adapter is the official OpenAI SDK, aimed at OpenRouter or OpenAI. A configu
 Keep tools separate from the HTTP server and authentication. Do not add shell access or arbitrary code execution.
 
 There is no browser UI in a newly generated app. A separate client, including a Mac-side bridge, can call the HTTP API. Cloud hosts cannot access Apple Messages, and this app does not integrate with iMessage.
+
+Replace the sample temperature-conversion instructions in `src/agent.ts` and the sample tool in `src/tools.ts` when building your own agent. Update each tool's name, description, input schema, and implementation together; remove unused tools instead of advertising capabilities the app does not provide.
 
 ## Deploy
 
@@ -115,11 +127,20 @@ A failed stream ends with an error frame instead of done. Partial output followe
 
 ## Limits
 
-The defaults limit bodies to 32 KiB, stored history as described above, the complete model request to 20 messages and 16,000 characters, chats to four concurrent requests per instance, and each chat to 30 seconds. Agent loops allow three model/tool steps, up to 1,024 output tokens per step and 64 KiB streamed text.
+The defaults limit bodies to 32 KiB, the complete model request to 20 messages and 16,000 characters, chats to four concurrent requests per instance, and each chat to 30 seconds. Agent loops allow three model/tool steps, a default of 4,096 output tokens per step, and 64 KiB of streamed text.
 
 These controls are not hard spending caps. Cancellation may not prevent all provider charges.
 
 Startup requires the selected model's API key, but does not verify it with the provider. An invalid or revoked key can still leave health working while chat fails. Test real chat only when authorized; health does not certify the model or tools.
+
+The owner can set top-level `maxOutputTokens` in `fastagent.yaml` to an integer from 1 to 16,384; omitted means 4,096. Clients cannot override it. Restart local development or redeploy after changing it. The cap applies separately to each model step, so a three-step request can use up to three budgets. Depending on the model/provider, reasoning tokens share the completion budget. Increasing the cap permits higher cost and latency, does not reserve or guarantee that many tokens, and does not raise the timeout or byte limits.
+
+```yaml
+# fastagent.yaml (top-level setting)
+maxOutputTokens: 8192
+```
+
+When the provider reports token exhaustion, the error frame and CLI expose `OUTPUT_TOKEN_LIMIT` with safe guidance. Ask for a shorter reply or have the owner increase the budget. Partial replies are not successful and are not saved to history. There is no automatic retry; retrying can incur additional model charges. Other provider failures remain generic and never expose provider payloads or reasoning.
 
 ## Tests and verification
 

@@ -88,9 +88,17 @@ Send a message with the headless client. The token is read only from the explici
 node dist/cli.js chat --url http://127.0.0.1:3000 --env-file ./my-agent/.env.auth --message "Hello"
 ```
 
-`chat` accepts `--message` or reads stdin, supports `--conversation <id>` to resume a server-assigned conversation, and `--json` for one machine-readable result. The URL must be HTTPS or explicit localhost HTTP. The client refuses credential-bearing redirects so the token is not sent to another origin. It bounds response size and total time.
+`chat` requires `--message`, or explicit `--stdin` (`--message -`), and supports `--json` for one machine-readable result. **Omitting `--conversation` starts a new conversation on every call.** To follow up on the first message above, copy the ID from `conversation: <id>` (or `conversationId` in JSON) and reuse it:
+
+```sh
+node dist/cli.js chat --url http://127.0.0.1:3000 --env-file ./my-agent/.env.auth --conversation "<id-from-first-response>" --message "Tell me more about your previous answer."
+```
+
+Use the actual server-assigned ID and the same app URL and token. The client refuses credential-bearing redirects, bounds response size and total time, and does not automatically resume your last chat.
 
 The agent will not start without the matching model key in `.env`: `OPENROUTER_API_KEY` for OpenRouter, or `OPENAI_API_KEY` for direct OpenAI. Missing, empty, or whitespace-only keys fail before readiness; `dev --json` reports `MODEL_API_KEY_MISSING`. Local models are not supported. Startup checks key presence only, not provider validity, and never calls a model.
+
+Local startup warns: “History is in memory and disappears on restart.” Restart after editing `.env` or `.env.auth`. Local `dev` inherits environment variables, which override both files; otherwise `.env.auth` overrides `.env` for duplicate assignments. Unset a conflicting inherited variable before restarting without printing its value. CLI `chat` and deployment do not inherit credentials from the shell.
 
 ## 4. Choose a model
 
@@ -235,6 +243,8 @@ Redis outages return safe 503 responses and never fall back to memory. Native re
 Limits and per-instance throttles reduce abuse but are not hard spending caps. Treat your app code as trusted: upload filtering cannot find every secret embedded in source.
 
 There is no native iMessage integration. A separate Mac-side bridge can call this API over HTTPS with the bearer token; cloud hosts cannot access Apple Messages.
+
+Token apps default to 4,096 output tokens per model step. Set top-level `maxOutputTokens: 8192` in `fastagent.yaml` to change it (integer 1–16,384); restart or redeploy to apply. Up to three model steps each receive this budget, and reasoning may consume it depending on the model/provider. Higher limits permit greater cost and latency, not more time or response bytes. A provider-reported token limit returns `OUTPUT_TOKEN_LIMIT`: request a shorter reply or increase the owner's budget. Truncated replies are never committed, and no automatic retry is made; retries can cost money.
 
 ## What has been verified
 

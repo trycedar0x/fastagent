@@ -48,6 +48,17 @@ test('scaffold: explicit name, standalone runnable metadata and nested runtime a
   const readme = await readFile(join(result.directory, 'README.md'), 'utf8');
   assert.match(readme, /runnable Node.js 22/);
   assert.match(readme, /not a cloud deployment integration/);
+  assert.ok(readme.includes('Omitting `--conversation` starts a new conversation on every call.'));
+  assert.ok(readme.includes('`conversation: <id>`'));
+  assert.ok(readme.includes('`conversationId` field with `--json`'));
+  assert.ok(readme.includes('--conversation "<id-from-first-response>" --message'));
+  assert.ok(readme.includes('Local development and ephemeral production history are lost on restart'));
+  assert.equal((readme.match(/node \/path\/to\/fastagent\/dist\/cli\.js dev/g) ?? []).length, 1);
+  assert.ok(readme.includes('Existing inherited environment variables take precedence'));
+  assert.ok(readme.includes('The CLI `chat` client reads its bearer token only from the explicit'));
+  assert.ok(readme.includes("If that value differs from the client's file, chat authentication fails."));
+  assert.ok(readme.includes('Replace the sample temperature-conversion instructions'));
+  assert.ok(readme.includes('maxOutputTokens: 8192'));
 });
 
 test('scaffold: init generates an ignored owner-only bearer token that is never overwritten', async (t) => {

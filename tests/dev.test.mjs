@@ -3,7 +3,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import childProcess from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { EventEmitter, once } from 'node:events';
-import { readdir, symlink } from 'node:fs/promises';
+import { readdir, symlink, writeFile } from 'node:fs/promises';
 import { syncBuiltinESMExports } from 'node:module';
 import { createServer } from 'node:net';
 import { join } from 'node:path';
@@ -32,6 +32,18 @@ test('dev: no automatic installation, clear errors for missing project/dependenc
   const project = await initProject({ directory: 'agent', cwd });
   await assert.rejects(devProject({ directory: project.directory }), { code: 'DEV_DEPENDENCIES_MISSING' });
   assert.ok(!(await readdir(project.directory)).includes('node_modules'));
+});
+
+test('dev: Node env loading uses inherited values before auth file before env file, refreshed only on restart', async t => {
+  const cwd = await temporaryDirectory(t);
+  await writeFile(join(cwd, '.env'), 'PROBE=env-file\n');
+  await writeFile(join(cwd, '.env.auth'), 'PROBE=auth-file\n');
+  const run = env => spawnSync(process.execPath, ['--env-file-if-exists=.env', '--env-file-if-exists=.env.auth', '-e', 'process.stdout.write(process.env.PROBE)'], { cwd, env, encoding: 'utf8' });
+  assert.equal(run({}).stdout, 'auth-file');
+  assert.equal(run({ PROBE: 'inherited' }).stdout, 'inherited');
+  await writeFile(join(cwd, '.env.auth'), 'PROBE=restarted-file\n');
+  assert.equal(run({}).stdout, 'restarted-file');
+  assert.equal(run({ PROBE: 'inherited' }).stdout, 'inherited');
 });
 
 test('dev: install requires opt-in and all launches use argument arrays without shell', async t => {
@@ -66,7 +78,7 @@ test('dev/CLI: generated app announces readiness after listening and SIGTERM shu
   await new Promise(resolve => probe.listen(0, '127.0.0.1', resolve));
   const port = probe.address().port; await new Promise(resolve => probe.close(resolve));
   const apiToken = randomBytes(32).toString('base64url');
-  const child = spawn(process.execPath, [cli, 'dev', project.directory], { cwd, env: { PATH: process.env.PATH, PORT: String(port), FASTAGENT_API_TOKEN: apiToken, OPENROUTER_API_KEY: 'synthetic-not-used-for-health' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, [cli, 'dev', project.directory, '--json'], { cwd, env: { PATH: process.env.PATH, PORT: String(port), FASTAGENT_API_TOKEN: apiToken, OPENROUTER_API_KEY: 'synthetic-not-used-for-health' }, stdio: ['ignore', 'pipe', 'pipe'] });
   t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); });
   let stdout = ''; let stderr = '';
   child.stderr.on('data', chunk => { stderr += chunk; });
@@ -74,12 +86,13 @@ test('dev/CLI: generated app announces readiness after listening and SIGTERM shu
     const timer = setTimeout(() => reject(new Error(`readiness timeout: ${stdout} ${stderr}`)), 10000);
     child.stdout.on('data', chunk => {
       stdout += chunk;
-      if (stdout.includes('Headless chat service ready.')) { clearTimeout(timer); resolve(); }
+      if (stdout.includes('"command":"dev"')) { clearTimeout(timer); resolve(); }
     });
     child.once('exit', code => { clearTimeout(timer); reject(new Error(`early exit ${code}: ${stderr}`)); });
   });
-  assert.equal(stdout, 'Headless chat service ready.\n');
+  assert.deepEqual(JSON.parse(stdout), { ok: true, command: 'dev', url: `http://localhost:${port}` });
   assert.ok(!stdout.includes(apiToken) && !stderr.includes(apiToken));
+  assert.ok(stderr.includes('History is in memory and disappears on restart.'));
   const health = await fetch(`http://127.0.0.1:${port}/healthz`); assert.deepEqual(await health.json(), { ok: true });
   assert.equal((await fetch(`http://127.0.0.1:${port}/api/session`)).status, 404);
   const exited = once(child, 'exit'); child.kill('SIGTERM');

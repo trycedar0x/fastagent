@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { parseDocument } from 'yaml';
 import { z } from 'zod';
-import { createModel, selectModelApiKey, resolveModelReference } from './agent.js';
+import { createModel, selectModelApiKey, resolveModelReference, defaultMaxOutputTokens, outputTokenLimit } from './agent.js';
 import { validateApiToken } from './auth.js';
 import type { ChatModel } from './agent.js';
 import type { HistoryStore } from './history-store.js';
@@ -14,6 +14,7 @@ const schema = z.strictObject({
   name: z.string().min(1).max(63).regex(/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/),
   framework: z.literal('openai'),
   model: z.string().trim().min(1).max(270).regex(/^[^\x00-\x1f\x7f]+$/).default(DEFAULT_MODEL_REFERENCE),
+  maxOutputTokens: z.number().int().min(1).max(outputTokenLimit).optional(),
   deployment: z.strictObject({ access: z.literal('token') }),
 });
 
@@ -29,6 +30,7 @@ export interface RuntimeConfig {
   localDev: boolean;
   apiToken: string;
   model: ChatModel | undefined;
+  maxOutputTokens?: number;
   redisUrl?: string | undefined;
   historyNamespace?: string;
   // Opt-in production in-memory history for single-instance deployments; never a Redis outage fallback.
@@ -39,6 +41,9 @@ export interface RuntimeConfig {
 
 export function validateRuntimeConfig(config: RuntimeConfig): void {
   validateApiToken(config.apiToken);
+  if (config.maxOutputTokens !== undefined && (!Number.isSafeInteger(config.maxOutputTokens) || config.maxOutputTokens < 1 || config.maxOutputTokens > outputTokenLimit)) {
+    throw new Error('maxOutputTokens must be an integer from 1 to 16384 in fastagent.yaml.');
+  }
   let url: URL;
   try { url = new URL(config.origin); } catch { throw new Error('Invalid APP_ORIGIN configuration.'); }
   if (config.localDev && url.hostname === '[::1]') throw new Error('IPv6 localhost APP_ORIGIN is not supported. Use http://localhost or http://127.0.0.1 with the configured port.');
@@ -57,13 +62,20 @@ export function validateRuntimeConfig(config: RuntimeConfig): void {
 export async function loadRuntimeConfig(env: NodeJS.ProcessEnv): Promise<RuntimeConfig> {
   let modelIdentifier: string;
   let appName: string;
+  let maxOutputTokens: number;
   try {
     const document = parseDocument(await readFile('fastagent.yaml', 'utf8'), { uniqueKeys: true });
     if (document.errors.length) throw new Error();
     const project = schema.parse(document.toJS({ maxAliasCount: 0 }));
     modelIdentifier = project.model;
     appName = project.name;
-  } catch { throw new Error('Invalid fastagent.yaml configuration.'); }
+    maxOutputTokens = project.maxOutputTokens ?? defaultMaxOutputTokens;
+  } catch (error) {
+    if (error instanceof z.ZodError && error.issues.some(issue => issue.path[0] === 'maxOutputTokens')) {
+      throw new Error('maxOutputTokens must be an integer from 1 to 16384 in fastagent.yaml.');
+    }
+    throw new Error('Invalid fastagent.yaml configuration.');
+  }
   if (env.FASTAGENT_LOCAL_DEV !== undefined && env.FASTAGENT_LOCAL_DEV !== '1') throw new Error('Invalid local development configuration.');
   if (env.FASTAGENT_EPHEMERAL_HISTORY !== undefined && env.FASTAGENT_EPHEMERAL_HISTORY !== '1') throw new Error(EPHEMERAL_HISTORY_VALUE_ERROR);
   const apiKey = selectModelApiKey(modelIdentifier, env);
@@ -74,6 +86,7 @@ export async function loadRuntimeConfig(env: NodeJS.ProcessEnv): Promise<Runtime
     localDev,
     apiToken: env.FASTAGENT_API_TOKEN ?? '',
     model: createModel(modelIdentifier, apiKey),
+    maxOutputTokens,
     redisUrl: env.REDIS_URL,
     historyNamespace: env.FASTAGENT_HISTORY_NAMESPACE ?? appName,
     ephemeralHistory: env.FASTAGENT_EPHEMERAL_HISTORY === '1',

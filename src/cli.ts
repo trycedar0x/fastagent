@@ -37,7 +37,7 @@ Starting an agent requires OPENROUTER_API_KEY for openrouter models, or OPENAI_A
 init and dev are implemented, alongside models/chat and login/deploy/status/logs/destroy.
 models reads the public OpenRouter catalog. Prices are estimates with timestamps and source URLs; unknown prices stay unknown.
 chat is headless. It reads FASTAGENT_API_TOKEN only from explicit --env-file paths, never from arguments or the shell.
-Pass --message <text>, or --stdin (or --message -) to read piped stdin explicitly. Chat never reads stdin implicitly, so a coding-agent tool call cannot hang. --conversation resumes a server ID. URL must be HTTPS or explicit localhost HTTP.
+Pass --message <text>, or --stdin (or --message -) to read piped stdin explicitly. Chat never reads stdin implicitly, so a coding-agent tool call cannot hang. --conversation resumes a server ID; omitting it starts a new conversation on every call. URL must be HTTPS or explicit localhost HTTP.
 Redirects are refused so the bearer token cannot be sent to another origin. Chat can incur model charges.
 Deployment commands use the current directory; target defaults to fastagent.yaml name.
 Railway flags: --workspace <id> --auth-file <ignored-env-file>
@@ -71,6 +71,8 @@ TTY keys: arrows select, R refresh health + explicit selected provider status wh
 are supplied, Enter open URL, L logs with selectors/auth, Q quit. Polling never calls models
 or cloud status APIs. Recorded deployment status and HTTP health remain separate.
 dev runs on explicit localhost HTTP; --install opts in to npm installation.
+Token apps accept optional top-level maxOutputTokens in fastagent.yaml: integer 1–16384, default 4096 per model step (up to three steps). Higher caps permit higher cost/latency; reasoning may share the budget. Restart/redeploy after changes. OUTPUT_TOKEN_LIMIT means request a shorter reply or ask the owner to raise this setting; no automatic retries.
+Local dev inherits environment variables, which override .env.auth, then .env. Restart after file edits; unset conflicting inherited values without printing secrets. Local history disappears on restart. chat/deploy never inherit credentials from the shell.
 dev --json prints one {"ok":true,"command":"dev","url":...} line once the server listens, then runs until stopped.
 There is no native iMessage integration. A separate Mac-side bridge can call this API; cloud hosts cannot access Apple Messages.
 Version 0.2.0 provides headless bearer-token apps. Published npm 0.1.0 is the previous password-protected app.
