@@ -21,7 +21,7 @@ Agent idea: [Describe who it helps, what it should do, and any APIs it needs.]
 
 Build the CLI from source: clone https://github.com/trycedar0x/fastagent,
 run npm ci and npm run build, then use node dist/cli.js for every command.
-Alternatively, install @0xtryeva/fastagent@0.2.0 with npm and use fastagent.
+Alternatively, install @0xtryeva/fastagent@0.2.1 with npm and use fastagent.
 Version 0.1.0 is the older password-protected release.
 Create the app in a new directory; never overwrite existing files.
 
@@ -48,12 +48,12 @@ was actually verified; a dry run or health check does not prove chat works.
 
 ## Start here
 
-**Version 0.2.0:** `@0xtryeva/fastagent` provides the headless bearer-token CLI described here. Version 0.1.0 generated the earlier password-protected app. The unscoped `fastagent` npm package is a different, unrelated project.
+**Version 0.2.1:** `@0xtryeva/fastagent` provides the headless bearer-token CLI described here. Version 0.1.0 generated the earlier password-protected app. The unscoped `fastagent` npm package is a different, unrelated project.
 
 You need Node.js 22+ and npm. Install the CLI and create an app:
 
 ```sh
-npm install -g @0xtryeva/fastagent@0.2.0
+npm install -g @0xtryeva/fastagent@0.2.1
 fastagent init ./my-agent --framework openai
 ```
 
